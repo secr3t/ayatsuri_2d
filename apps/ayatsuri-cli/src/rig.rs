@@ -85,8 +85,8 @@ const WORDS: &[(Kind, &[&str])] = &[
     (
         Kind::Face,
         &[
-            "face", "head", "nose", "ear", "cheek", "blush", "顔", "輪郭", "鼻", "耳", "頬", "얼굴",
-            "머리", "코", "귀", "볼",
+            "face", "head", "nose", "ear", "cheek", "blush", "顔", "輪郭", "鼻", "耳", "頬",
+            "얼굴", "머리", "코", "귀", "볼",
         ],
     ),
     (
@@ -130,21 +130,12 @@ fn has_word(text: &str, toks: &[String], word: &str) -> bool {
     if !word.is_ascii() {
         return text.contains(word);
     }
-    toks.iter().any(|t| {
-        if word.len() >= 4 {
-            t.contains(word)
-        } else {
-            t.starts_with(word)
-        }
-    })
+    toks.iter().any(|t| if word.len() >= 4 { t.contains(word) } else { t.starts_with(word) })
 }
 
 fn kind_of_text(text: &str) -> Option<Kind> {
     let toks = tokens(text);
-    WORDS
-        .iter()
-        .find(|(_, words)| words.iter().any(|w| has_word(text, &toks, w)))
-        .map(|&(k, _)| k)
+    WORDS.iter().find(|(_, words)| words.iter().any(|w| has_word(text, &toks, w))).map(|&(k, _)| k)
 }
 
 fn hair_role(text: &str) -> Role {
@@ -185,8 +176,19 @@ const LASH: &[&str] =
     &["lash", "lid", "まつ毛", "まつげ", "睫", "瞼", "まぶた", "속눈썹", "눈꺼풀", "아이라인"];
 const LOWER: &[&str] = &["lower", "bottom", "under", "下", "아래", "밑"];
 const BALL: &[&str] = &[
-    "white", "sclera", "iris", "pupil", "highlight", "白目", "瞳", "黒目", "ハイライト", "흰자",
-    "눈동자", "동공", "하이라이트",
+    "white",
+    "sclera",
+    "iris",
+    "pupil",
+    "highlight",
+    "白目",
+    "瞳",
+    "黒目",
+    "ハイライト",
+    "흰자",
+    "눈동자",
+    "동공",
+    "하이라이트",
 ];
 
 /// The first name that says which part, layer name before folders.
@@ -224,7 +226,12 @@ pub fn eye_parts(
 }
 
 /// The layer's name, then its folders from the innermost out.
-fn names_of(model: &Model, mesh: usize, mesh_names: &[String], part_names: &[String]) -> Vec<String> {
+fn names_of(
+    model: &Model,
+    mesh: usize,
+    mesh_names: &[String],
+    part_names: &[String],
+) -> Vec<String> {
     let mut out: Vec<String> = mesh_names.get(mesh).cloned().into_iter().collect();
     let mut part = model.art_meshes.get(mesh).and_then(|m| m.parent_part);
     let mut hops = 0;
@@ -508,14 +515,16 @@ fn shut_eyes(model: &mut Model, roles: &[Role], parts: &[EyePart]) {
                 EyePart::UpperLash => {
                     shape_mesh(model, mi, id, &keys, |v, pts| {
                         let shut = 1.0 - v;
-                        let (lo, hi) = pts.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
-                            (lo.min(p[1]), hi.max(p[1]))
-                        });
+                        let (lo, hi) = pts
+                            .iter()
+                            .fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
                         let cy = (lo + hi) * 0.5;
                         // drops onto the line and thins to half
                         let moved = pts
                             .iter()
-                            .map(|&[x, y]| [x, cy + (y - cy) * (1.0 - 0.5 * shut) + shut * (line - cy)])
+                            .map(|&[x, y]| {
+                                [x, cy + (y - cy) * (1.0 - 0.5 * shut) + shut * (line - cy)]
+                            })
                             .collect();
                         (moved, 1.0)
                     });
@@ -647,6 +656,18 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
     let neck = union(model, &|r| r == Role::Face)
         .or_else(|| union(model, &|r| r != Role::Body))
         .map(|[x0, _, x1, y1]| ((x0 + x1) * 0.5, y1));
+    // long side or back hair (twintails, hair to the waist) hangs past the
+    // face by more than half its height: inside the head warp a turn would
+    // stretch it to the knees, so it only turns with the head's rotation
+    let face = union(model, &|r| r == Role::Face);
+    let long: Vec<&str> = [(Role::HairSide, "WarpHairSide"), (Role::HairBack, "WarpHairBack")]
+        .into_iter()
+        .filter(|&(role, _)| match (face, union(model, &|r| r == role)) {
+            (Some([_, y0, _, y1]), Some([_, _, _, bottom])) => bottom > y1 + (y1 - y0) * 0.5,
+            _ => false,
+        })
+        .map(|(_, id)| id)
+        .collect();
 
     // the feature warps, straight over their meshes
     let mut made: Vec<&str> = Vec::new();
@@ -662,13 +683,16 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
 
     // the head: a warp over the face and its features, a rotation over that
     let mut head: Vec<Child> = meshes(Role::Face).into_iter().map(Child::Mesh).collect();
-    head.extend(made.iter().filter_map(|id| deformer(model, id)).map(Child::Deformer));
+    let short = made.iter().filter(|id| !long.contains(id));
+    head.extend(short.filter_map(|id| deformer(model, id)).map(Child::Deformer));
     let mut body: Vec<Child> = meshes(Role::Body).into_iter().map(Child::Mesh).collect();
     if !head.is_empty() {
         wrap(model, NewDeformer::Warp { rows: 4, cols: 4 }, &head, "WarpHead")?;
-        let warp = deformer(model, "WarpHead").ok_or("WarpHead went missing")?;
+        let mut turned: Vec<Child> =
+            deformer(model, "WarpHead").map(Child::Deformer).into_iter().collect();
+        turned.extend(long.iter().filter_map(|id| deformer(model, id)).map(Child::Deformer));
         let rotation = NewDeformer::Rotation { origin: neck };
-        wrap(model, rotation, &[Child::Deformer(warp)], "RotHead")?;
+        wrap(model, rotation, &turned, "RotHead")?;
         body.extend(deformer(model, "RotHead").map(Child::Deformer));
     }
     if !body.is_empty() {
@@ -763,7 +787,8 @@ mod tests {
         assert_eq!(k("속눈썹"), Some(Kind::Eye), "an eyelash, not a brow");
         assert_eq!(k("eyelid_L"), Some(Kind::Eye));
         assert_eq!(k("armor"), Some(Kind::Body));
-        let part = |names: &[&str]| eye_part(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let part =
+            |names: &[&str]| eye_part(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         assert_eq!(part(&["上まつ毛"]), EyePart::UpperLash);
         assert_eq!(part(&["아래 속눈썹"]), EyePart::LowerLash);
         assert_eq!(part(&["L", "白目"]), EyePart::Ball, "the folder says it");
@@ -785,7 +810,8 @@ mod tests {
                 })
                 .collect()
         };
-        let get = |v: &[(usize, f32, f32)], m: usize| v.iter().find(|x| x.0 == m).map(|x| (x.1, x.2));
+        let get =
+            |v: &[(usize, f32, f32)], m: usize| v.iter().find(|x| x.0 == m).map(|x| (x.1, x.2));
         let open = look(&puppet);
         puppet.set_value(param(&model, "ParamEyeLOpen").unwrap(), 0.0);
         puppet.update();
@@ -848,6 +874,8 @@ mod tests {
             blob("brow r", "", (160.0, 170.0, 24.0, 5.0), [60, 40, 30]),
             blob("mouth", "", (200.0, 265.0, 20.0, 6.0), [200, 70, 80]),
             blob("bangs", "Hair", (200.0, 110.0, 105.0, 45.0), [90, 55, 40]),
+            // twintails: down to y 580, far past the face (y 80 to 320)
+            blob("side hair", "Hair", (200.0, 340.0, 130.0, 240.0), [90, 55, 40]),
         ];
         Document { width: 400, height: 600, layers, folders: vec![] }
     }
@@ -872,7 +900,7 @@ mod tests {
         use Role::*;
         let (model, _, r) = rigged();
         let want = [HairBack, Body, Body, Face, EyeL, EyeL, EyeL, EyeL, EyeL, EyeR, BrowL, BrowR];
-        assert_eq!(r, [&want[..], &[Mouth, HairFront]].concat());
+        assert_eq!(r, [&want[..], &[Mouth, HairFront, HairSide]].concat());
         let mut puppet = ayatsuri_core::Puppet::new(model.clone());
         puppet.update();
         let snap = |p: &ayatsuri_core::Puppet| -> Vec<(usize, Vec<f32>)> {
@@ -905,12 +933,15 @@ mod tests {
         assert_eq!(moved("ParamBrowLY", 1.0), vec![BrowL]);
         assert_eq!(moved("ParamMouthOpenY", 1.0), vec![Mouth]);
         assert_eq!(moved("ParamHairFront", 1.0), vec![HairFront]);
+        assert_eq!(moved("ParamHairSide", 1.0), vec![HairSide]);
+        // the long twintails stay out of the turn but tilt with the head
         assert_eq!(moved("ParamAngleX", 30.0), head);
-        assert_eq!(moved("ParamAngleZ", 30.0), head);
-        let mut all = head.clone();
+        let tilted = vec![Face, EyeL, EyeR, BrowL, BrowR, Mouth, HairFront, HairSide, HairBack];
+        assert_eq!(moved("ParamAngleZ", 30.0), tilted);
+        let mut all = tilted.clone();
         all.push(Body);
         assert_eq!(moved("ParamBodyAngleX", 10.0), all);
-        assert_eq!(model.physics.as_ref().map(|p| p.groups.len()), Some(2));
+        assert_eq!(model.physics.as_ref().map(|p| p.groups.len()), Some(3));
     }
 
     #[test]
