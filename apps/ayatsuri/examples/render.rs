@@ -209,7 +209,13 @@ fn main() -> Result<(), String> {
                     } else {
                         sample(tex, u, v)
                     };
-                    let a = src[3] * d.opacity;
+                    let clip = if masked {
+                        let c = coverage.get(py * out_w + px).copied().unwrap_or(0.0);
+                        if inverted { 1.0 - c } else { c }
+                    } else {
+                        1.0
+                    };
+                    let a = src[3] * d.opacity * clip;
                     if a <= 0.003 {
                         continue;
                     }

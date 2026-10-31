@@ -45,7 +45,7 @@ fn run() -> Result<(), String> {
     let imported = ayatsuri_import::from_layers_atlas(&doc).map_err(|e| format!("{input}: {e}"))?;
     let mut model = imported.model;
     let roles = rig::roles(&model, &imported.mesh_names, &imported.part_names);
-    let parts = rig::eye_parts(&model, &roles, &imported.mesh_names, &imported.part_names);
+    let parts = rig::parts(&model, &roles, &imported.mesh_names, &imported.part_names);
     for (i, (role, part)) in roles.iter().zip(&parts).enumerate() {
         let name = imported.mesh_names.get(i).map_or("?", String::as_str);
         println!("{:<11} {:<11} {name}", role.name(), part.name());

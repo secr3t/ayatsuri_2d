@@ -6,15 +6,17 @@
 //
 // The tree, parents first:
 //
-//   WarpBody (ParamBodyAngleX, ParamBreath)
+//   WarpBody (ParamBodyAngleX, Y, Z, ParamBreath)
 //     body meshes
 //     RotHead (ParamAngleZ), pivot at the bottom of the face
 //       WarpHead (ParamAngleX x ParamAngleY)
 //         face meshes
-//         WarpEyeL / WarpEyeR (ParamEyeLOpen / ParamEyeROpen)
+//         WarpEyeL / WarpEyeR, their meshes keyed on ParamEyeLOpen /
+//           ParamEyeROpen and the irises on ParamEyeBallX x Y
 //         WarpBrowL / WarpBrowR (ParamBrowLY / ParamBrowRY)
 //         WarpMouth (ParamMouthOpenY x ParamMouthForm)
 //         WarpHairFront / Side / Back (ParamHair*, swung by physics)
+//       long WarpHairSide / Back, following ParamAngleX x Y at the top
 //
 // L and R are the character's own: the left eye is the one on the
 // viewer's right. PSD models are in canvas-height units, y down.
@@ -160,25 +162,31 @@ fn hair_role(text: &str) -> Role {
     }
 }
 
-/// What an eye layer is, so it shuts the way riggers shut it: the upper
-/// lash comes down onto the lower one, the eyeball (white, iris,
-/// highlight) folds away under it, the lower lash stays. A layer that says
-/// none of these (an eye drawn as one piece) is squashed whole.
+/// What an eye or mouth layer is, so it moves the way riggers move it:
+/// the upper lash comes down and the lower lash up to meet it, the white
+/// folds shut between them and clips the iris (with the pupil and
+/// highlight), which looks about; the mouth's inside shows only when it
+/// opens. An eye layer that says none of these (an eye drawn as one piece)
+/// is squashed whole.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EyePart {
+pub enum Part {
     UpperLash,
     LowerLash,
-    Ball,
+    White,
+    Iris,
+    MouthInside,
     Other,
 }
 
-impl EyePart {
+impl Part {
     pub fn name(self) -> &'static str {
         match self {
-            EyePart::UpperLash => "upper lash",
-            EyePart::LowerLash => "lower lash",
-            EyePart::Ball => "eyeball",
-            EyePart::Other => "",
+            Part::UpperLash => "upper lash",
+            Part::LowerLash => "lower lash",
+            Part::White => "eye white",
+            Part::Iris => "iris",
+            Part::MouthInside => "inside",
+            Part::Other => "",
         }
     }
 }
@@ -186,52 +194,63 @@ impl EyePart {
 const LASH: &[&str] =
     &["lash", "lid", "まつ毛", "まつげ", "睫", "瞼", "まぶた", "속눈썹", "눈꺼풀", "아이라인"];
 const LOWER: &[&str] = &["lower", "bottom", "under", "下", "아래", "밑"];
-const BALL: &[&str] = &[
-    "white",
-    "sclera",
-    "iris",
-    "pupil",
-    "highlight",
-    "白目",
-    "瞳",
-    "黒目",
-    "ハイライト",
-    "흰자",
-    "눈동자",
-    "동공",
-    "하이라이트",
+const WHITE: &[&str] = &["white", "sclera", "白目", "흰자"];
+const IRIS: &[&str] =
+    &["iris", "pupil", "highlight", "瞳", "黒目", "ハイライト", "눈동자", "동공", "하이라이트"];
+const INSIDE: &[&str] = &[
+    "inside",
+    "inner",
+    "teeth",
+    "tongue",
+    "口内",
+    "口の中",
+    "歯",
+    "舌",
+    "입안",
+    "입 안",
+    "입속",
+    "치아",
+    "혀",
 ];
 
-/// The first name that says which part, layer name before folders.
-fn eye_part(names: &[String]) -> EyePart {
-    let says = |text: &str, words: &[&str]| {
-        let toks = tokens(text);
-        words.iter().any(|w| has_word(text, &toks, w))
-    };
-    for n in names {
-        if says(n, LASH) {
-            return if says(n, LOWER) { EyePart::LowerLash } else { EyePart::UpperLash };
-        }
-        if says(n, BALL) {
-            return EyePart::Ball;
-        }
-    }
-    EyePart::Other
+fn says(text: &str, words: &[&str]) -> bool {
+    let toks = tokens(text);
+    words.iter().any(|w| has_word(text, &toks, w))
 }
 
-/// Each eye layer's part (from [`roles`]); `Other` for every other layer.
-pub fn eye_parts(
+/// The first name that says which eye part, layer name before folders.
+fn eye_part(names: &[String]) -> Part {
+    for n in names {
+        if says(n, LASH) {
+            return if says(n, LOWER) { Part::LowerLash } else { Part::UpperLash };
+        }
+        if says(n, WHITE) {
+            return Part::White;
+        }
+        if says(n, IRIS) {
+            return Part::Iris;
+        }
+    }
+    Part::Other
+}
+
+/// Each eye and mouth layer's part (from [`roles`]); `Other` for the rest.
+pub fn parts(
     model: &Model,
     roles: &[Role],
     mesh_names: &[String],
     part_names: &[String],
-) -> Vec<EyePart> {
+) -> Vec<Part> {
     roles
         .iter()
         .enumerate()
-        .map(|(i, r)| match r {
-            Role::EyeL | Role::EyeR => eye_part(&names_of(model, i, mesh_names, part_names)),
-            _ => EyePart::Other,
+        .map(|(i, r)| {
+            let names = || names_of(model, i, mesh_names, part_names);
+            match r {
+                Role::EyeL | Role::EyeR => eye_part(&names()),
+                Role::Mouth if names().iter().any(|n| says(n, INSIDE)) => Part::MouthInside,
+                _ => Part::Other,
+            }
         })
         .collect()
 }
@@ -357,18 +376,22 @@ pub fn roles(model: &Model, mesh_names: &[String], part_names: &[String]) -> Vec
 /// them is drawn, so no parameter is left dead. Live2D's Standard
 /// Parameter List, plus ParamWing. Face, eye and mouth ones are always
 /// made: trackers drive them and model3.json's EyeBlink and LipSync
-/// groups name them.
+/// groups name them. The eyeballs' are made when an iris is drawn.
 const PARAMS: &[(&str, f32, f32, f32, &[Role])] = &[
     ("ParamAngleX", -30.0, 0.0, 30.0, &[]),
     ("ParamAngleY", -30.0, 0.0, 30.0, &[]),
     ("ParamAngleZ", -30.0, 0.0, 30.0, &[]),
     ("ParamEyeLOpen", 0.0, 1.0, 1.0, &[]),
     ("ParamEyeROpen", 0.0, 1.0, 1.0, &[]),
+    ("ParamEyeBallX", -1.0, 0.0, 1.0, &[]),
+    ("ParamEyeBallY", -1.0, 0.0, 1.0, &[]),
     ("ParamBrowLY", -1.0, 0.0, 1.0, &[Role::BrowL]),
     ("ParamBrowRY", -1.0, 0.0, 1.0, &[Role::BrowR]),
     ("ParamMouthForm", -1.0, 0.0, 1.0, &[]),
     ("ParamMouthOpenY", 0.0, 0.0, 1.0, &[]),
     ("ParamBodyAngleX", -10.0, 0.0, 10.0, &[]),
+    ("ParamBodyAngleY", -10.0, 0.0, 10.0, &[]),
+    ("ParamBodyAngleZ", -10.0, 0.0, 10.0, &[]),
     ("ParamBreath", 0.0, 0.0, 1.0, &[]),
     ("ParamHairFront", -1.0, 0.0, 1.0, &[Role::HairFront]),
     ("ParamHairSide", -1.0, 0.0, 1.0, &[Role::HairSide]),
@@ -392,6 +415,9 @@ const FEATURES: &[(Role, &str, u32, u32)] = &[
 
 /// Wing warps hang on the body: a lean carries them, a head turn does not.
 const WINGS: &[&str] = &["WarpWingL", "WarpWingR"];
+
+/// ParamBodyAngleZ tips the chest the way ParamAngleZ tips the head.
+const BODY_TILT: f32 = -1.0;
 
 fn param(model: &Model, id: &str) -> Option<usize> {
     model.parameters.iter().position(|p| p.id == id)
@@ -433,7 +459,8 @@ fn key(model: &mut Model, di: usize, axes: &[(&str, &[f32])]) -> Option<Vec<Vec<
 
 /// Key warp `id` on `axes` and shape every keyform: `f` gets the keyform's
 /// values (in `axes` order) and a grid point's (u, v) across the grid, 0 to
-/// 1, and says how far the point moves in grid widths and heights.
+/// 1, and says how far the point moves in grid widths and heights, on top
+/// of the shape the keyform already has (a warp keyed twice keeps both).
 fn shape_warp(
     model: &mut Model,
     id: &str,
@@ -452,11 +479,11 @@ fn shape_warp(
     for (k, vals) in values.iter().enumerate() {
         let Some(form) = w.positions.get_mut(k * per..(k + 1) * per) else { continue };
         let (points, _) = form.as_chunks_mut::<2>();
-        for (i, (p, &[bx, by])) in points.iter_mut().zip(pairs).enumerate() {
+        for (i, p) in points.iter_mut().enumerate() {
             let u = (i % (cols + 1)) as f32 / cols as f32;
             let v = (i / (cols + 1)) as f32 / rows as f32;
             let (dx, dy) = f(vals, u, v);
-            *p = [bx + dx * bw, by + dy * bh];
+            *p = [p[0] + dx * bw, p[1] + dy * bh];
         }
     }
     Some(())
@@ -478,27 +505,29 @@ fn shape_rotation(
     Some(())
 }
 
-/// Key art mesh `mi` on parameter `id` at `keys` and shape every keyform:
-/// `f` gets the key and the rest form's points, and returns the keyform's
-/// points and opacity.
+/// Key art mesh `mi` on `axes` and shape every keyform: `f` gets the
+/// keyform's values (in `axes` order) and the rest form's points, and
+/// returns the keyform's points and opacity.
 fn shape_mesh(
     model: &mut Model,
     mi: usize,
-    id: &str,
-    keys: &[f32],
-    f: impl Fn(f32, &[[f32; 2]]) -> (Vec<[f32; 2]>, f32),
+    axes: &[(&str, &[f32])],
+    f: impl Fn(&[f32], &[[f32; 2]]) -> (Vec<[f32; 2]>, f32),
 ) -> Option<()> {
-    let p = param(model, id)?;
-    edit::add_keys(model, Target::ArtMesh(mi), p, keys);
+    let mut params = Vec::with_capacity(axes.len());
+    for (id, keys) in axes {
+        let p = param(model, id)?;
+        edit::add_keys(model, Target::ArtMesh(mi), p, keys);
+        params.push(p);
+    }
     let m = model.art_meshes.get_mut(mi)?;
-    let values: Vec<f32> = (0..m.binding.keyform_count())
-        .map(|k| values_at(&m.binding, &[p], k).first().copied().unwrap_or(0.0))
-        .collect();
+    let values: Vec<Vec<f32>> =
+        (0..m.binding.keyform_count()).map(|k| values_at(&m.binding, &params, k)).collect();
     let n = (m.vertex_count as usize).saturating_mul(2);
     let base = m.positions.get(..n)?.to_vec();
     let (rest, _) = base.as_chunks::<2>();
-    for (k, &v) in values.iter().enumerate() {
-        let (points, opacity) = f(v, rest);
+    for (k, vals) in values.iter().enumerate() {
+        let (points, opacity) = f(vals, rest);
         if let Some(form) = m.positions.get_mut(k * n..(k + 1) * n) {
             for (dst, src) in form.as_chunks_mut::<2>().0.iter_mut().zip(&points) {
                 *dst = *src;
@@ -511,57 +540,111 @@ fn shape_mesh(
     Some(())
 }
 
-/// Shut each eye by its parts (see [`EyePart`]), on keys 0, 0.5 and 1 so
-/// the eyeball stays solid until the lids are half way.
-fn shut_eyes(model: &mut Model, roles: &[Role], parts: &[EyePart]) {
-    for (side, id) in [(Role::EyeL, "ParamEyeLOpen"), (Role::EyeR, "ParamEyeROpen")] {
+/// Shut each eye by its parts (see [`Part`]), on keys 0, 0.5 and 1 so the
+/// white stays solid until the lids are half way, and turn its irises in
+/// the white on ParamEyeBallX and Y.
+fn shut_eyes(model: &mut Model, roles: &[Role], parts: &[Part]) {
+    let sides = [(Role::EyeL, "ParamEyeLOpen"), (Role::EyeR, "ParamEyeROpen")];
+    for (side, id) in sides {
         let eye: Vec<usize> =
             roles.iter().enumerate().filter(|&(_, &r)| r == side).map(|(i, _)| i).collect();
-        let part = |i: usize| parts.get(i).copied().unwrap_or(EyePart::Other);
-        let union = |model: &Model, pick: &dyn Fn(EyePart) -> bool| {
+        let part = |i: usize| parts.get(i).copied().unwrap_or(Part::Other);
+        let union = |model: &Model, pick: &dyn Fn(Part) -> bool| {
             eye.iter()
                 .filter(|&&i| pick(part(i)))
                 .filter_map(|&i| mesh_box(model, i))
                 .fold(None, |b, m| Some(grow(b, m)))
         };
         let Some([_, y0, _, y1]) = union(model, &|_| true) else { continue };
-        // the lids meet on the lower lash, else 60% down the eye
-        let line = union(model, &|p| p == EyePart::LowerLash)
-            .map_or(y0 + (y1 - y0) * 0.6, |[_, a, _, b]| (a + b) * 0.5);
+        let mid_y = |b: Option<Box4>| b.map(|[_, a, _, b]| (a + b) * 0.5);
+        // the lids meet a quarter of the way up from the lower lash, else
+        // 60% down the eye
+        let line = match (
+            mid_y(union(model, &|p| p == Part::UpperLash)),
+            mid_y(union(model, &|p| p == Part::LowerLash)),
+        ) {
+            (Some(up), Some(low)) => low - (low - up) * 0.25,
+            (None, Some(low)) => low,
+            _ => y0 + (y1 - y0) * 0.6,
+        };
         let squash = move |pts: &[[f32; 2]], by: f32| -> Vec<[f32; 2]> {
             pts.iter().map(|&[x, y]| [x, line + (y - line) * (1.0 - by)]).collect()
         };
+        // a lash keeps its shape: it slides onto the line, the upper one
+        // thinning to half
+        let slide = move |pts: &[[f32; 2]], shut: f32, thin: f32| -> Vec<[f32; 2]> {
+            let (lo, hi) =
+                pts.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
+            let cy = (lo + hi) * 0.5;
+            let k = 1.0 - thin * shut;
+            pts.iter().map(|&[x, y]| [x, cy + (y - cy) * k + shut * (line - cy)]).collect()
+        };
+        let whites: Vec<u32> =
+            eye.iter().filter(|&&i| part(i) == Part::White).map(|&i| i as u32).collect();
+        let white = union(model, &|p| p == Part::White);
+        // the irises look about a quarter of the white's width
+        let reach = white
+            .or_else(|| union(model, &|_| true))
+            .map_or((0.0, 0.0), |[x0, y0, x1, y1]| ((x1 - x0) * 0.25, (y1 - y0) * 0.2));
+        let keys: &[f32] = &[0.0, 0.5, 1.0];
+        let gaze: &[f32] = &[-1.0, 0.0, 1.0];
         for &mi in &eye {
-            let keys = [0.0, 0.5, 1.0];
             match part(mi) {
-                EyePart::LowerLash => {}
-                EyePart::UpperLash => {
-                    shape_mesh(model, mi, id, &keys, |v, pts| {
-                        let shut = 1.0 - v;
-                        let (lo, hi) = pts
+                Part::UpperLash => {
+                    shape_mesh(model, mi, &[(id, keys)], |v, pts| {
+                        (slide(pts, 1.0 - v.first().copied().unwrap_or(1.0), 0.5), 1.0)
+                    });
+                }
+                Part::LowerLash => {
+                    shape_mesh(model, mi, &[(id, keys)], |v, pts| {
+                        (slide(pts, 1.0 - v.first().copied().unwrap_or(1.0), 0.0), 1.0)
+                    });
+                }
+                Part::White => {
+                    // shut it is a line: nothing shows, nothing it clips
+                    // shows, and half shut it is not see-through
+                    shape_mesh(model, mi, &[(id, keys)], |v, pts| {
+                        (squash(pts, 1.0 - v.first().copied().unwrap_or(1.0)), 1.0)
+                    });
+                }
+                Part::Iris => {
+                    if let Some(m) = model.art_meshes.get_mut(mi)
+                        && m.masks.is_empty()
+                    {
+                        m.masks = whites.clone();
+                    }
+                    // clipped by the white it shuts with; without one it
+                    // folds away and fades itself
+                    let alone = whites.is_empty();
+                    let fold = if alone { 0.95 } else { 0.0 };
+                    let axes = [(id, keys), ("ParamEyeBallX", gaze), ("ParamEyeBallY", gaze)];
+                    shape_mesh(model, mi, &axes, |v, pts| {
+                        let at = |i: usize| v.get(i).copied().unwrap_or(0.0);
+                        let (dx, dy) = (at(1) * reach.0, -at(2) * reach.1);
+                        let moved: Vec<[f32; 2]> = squash(pts, fold * (1.0 - at(0)))
                             .iter()
-                            .fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
-                        let cy = (lo + hi) * 0.5;
-                        // drops onto the line and thins to half
-                        let moved = pts
-                            .iter()
-                            .map(|&[x, y]| {
-                                [x, cy + (y - cy) * (1.0 - 0.5 * shut) + shut * (line - cy)]
-                            })
+                            .map(|&[x, y]| [x + dx, y + dy])
                             .collect();
-                        (moved, 1.0)
+                        (moved, if alone && at(0) <= 0.0 { 0.0 } else { 1.0 })
                     });
                 }
-                EyePart::Ball => {
-                    shape_mesh(model, mi, id, &keys, |v, pts| {
-                        (squash(pts, 0.95 * (1.0 - v)), if v <= 0.0 { 0.0 } else { 1.0 })
+                _ => {
+                    shape_mesh(model, mi, &[(id, keys)], |v, pts| {
+                        (squash(pts, 0.9 * (1.0 - v.first().copied().unwrap_or(1.0))), 1.0)
                     });
-                }
-                EyePart::Other => {
-                    shape_mesh(model, mi, id, &keys, |v, pts| (squash(pts, 0.9 * (1.0 - v)), 1.0));
                 }
             }
         }
+    }
+}
+
+/// The mouth's inside shows only once the mouth opens.
+fn open_mouth(model: &mut Model, parts: &[Part]) {
+    let inside = parts.iter().enumerate().filter(|&(_, &p)| p == Part::MouthInside);
+    for (mi, _) in inside {
+        shape_mesh(model, mi, &[("ParamMouthOpenY", &[0.0, 0.3, 1.0])], |v, pts| {
+            (pts.to_vec(), if v.first().copied().unwrap_or(0.0) > 0.0 { 1.0 } else { 0.0 })
+        });
     }
 }
 
@@ -588,6 +671,7 @@ fn hair_physics(n: usize, name: &str, output: &str) -> PhysicsGroup {
             input("ParamAngleX", 60.0, PhysicsIo::X),
             input("ParamAngleZ", 60.0, PhysicsIo::Angle),
             input("ParamBodyAngleX", 40.0, PhysicsIo::X),
+            input("ParamBodyAngleZ", 40.0, PhysicsIo::Angle),
         ],
         outputs: vec![PhysicsOutput {
             param: output.into(),
@@ -648,12 +732,14 @@ fn wrap(model: &mut Model, kind: NewDeformer, children: &[Child], id: &str) -> R
 }
 
 /// Build the rig over `roles` (one per art mesh, from [`roles`]) and the
-/// eyes' `parts` (from [`eye_parts`]): the standard parameters, the
+/// eyes' and mouth's `parts` (from [`parts`]): the standard parameters, the
 /// deformer tree, the keyforms and hair and wing physics.
-pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), String> {
+pub fn rig(model: &mut Model, roles: &[Role], parts: &[Part]) -> Result<(), String> {
     let drawn = |any: &[Role]| any.is_empty() || roles.iter().any(|r| any.contains(r));
+    let iris = parts.contains(&Part::Iris);
     for &(id, min, default, max, moves) in PARAMS {
-        if drawn(moves) && param(model, id).is_none() {
+        let wanted = if id.starts_with("ParamEyeBall") { iris } else { drawn(moves) };
+        if wanted && param(model, id).is_none() {
             model.parameters.push(Parameter {
                 id: id.into(),
                 min,
@@ -684,13 +770,27 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
     // face by more than half its height: inside the head warp a turn would
     // stretch it to the knees, so it only turns with the head's rotation
     let face = union(model, &|r| r == Role::Face);
-    let long: Vec<&str> = [(Role::HairSide, "WarpHairSide"), (Role::HairBack, "WarpHairBack")]
-        .into_iter()
-        .filter(|&(role, _)| match (face, union(model, &|r| r == role)) {
-            (Some([_, y0, _, y1]), Some([_, _, _, bottom])) => bottom > y1 + (y1 - y0) * 0.5,
-            _ => false,
-        })
-        .map(|(_, id)| id)
+    let long: Vec<(Role, &str)> =
+        [(Role::HairSide, "WarpHairSide"), (Role::HairBack, "WarpHairBack")]
+            .into_iter()
+            .filter(|&(role, _)| match (face, union(model, &|r| r == role)) {
+                (Some([_, y0, _, y1]), Some([_, _, _, bottom])) => bottom > y1 + (y1 - y0) * 0.5,
+                _ => false,
+            })
+            .collect();
+    let is_long = |r: Role| long.iter().any(|&(x, _)| x == r);
+    // where the warps' grids lie on the canvas, for the long hair to
+    // follow the head's turn (create_warp_deformer's 5% margin)
+    let grid = |[x0, y0, x1, y1]: Box4| {
+        let (mx, my) = ((x1 - x0) * 0.05, (y1 - y0) * 0.05);
+        [x0 - mx, y0 - my, x1 + mx, y1 + my]
+    };
+    let head_grid =
+        union(model, &|r| !is_long(r) && !matches!(r, Role::Body | Role::WingL | Role::WingR))
+            .map(grid);
+    let long_grids: Vec<(&str, Box4)> = long
+        .iter()
+        .filter_map(|&(role, id)| union(model, &|r| r == role).map(|b| (id, grid(b))))
         .collect();
 
     // the feature warps, straight over their meshes
@@ -707,14 +807,14 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
 
     // the head: a warp over the face and its features, a rotation over that
     let mut head: Vec<Child> = meshes(Role::Face).into_iter().map(Child::Mesh).collect();
-    let short = made.iter().filter(|id| !long.contains(id) && !WINGS.contains(id));
+    let short = made.iter().filter(|id| !long.iter().any(|(_, l)| l == *id) && !WINGS.contains(id));
     head.extend(short.filter_map(|id| deformer(model, id)).map(Child::Deformer));
     let mut body: Vec<Child> = meshes(Role::Body).into_iter().map(Child::Mesh).collect();
     if !head.is_empty() {
         wrap(model, NewDeformer::Warp { rows: 4, cols: 4 }, &head, "WarpHead")?;
         let mut turned: Vec<Child> =
             deformer(model, "WarpHead").map(Child::Deformer).into_iter().collect();
-        turned.extend(long.iter().filter_map(|id| deformer(model, id)).map(Child::Deformer));
+        turned.extend(long.iter().filter_map(|(_, id)| deformer(model, id)).map(Child::Deformer));
         let rotation = NewDeformer::Rotation { origin: neck };
         wrap(model, rotation, &turned, "RotHead")?;
         body.extend(deformer(model, "RotHead").map(Child::Deformer));
@@ -729,6 +829,7 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
     let pi = std::f32::consts::PI;
     let at = |v: &[f32], i: usize| v.get(i).copied().unwrap_or(0.0);
     shut_eyes(model, roles, parts);
+    open_mouth(model, parts);
     for (id, p) in [("WarpBrowL", "ParamBrowLY"), ("WarpBrowR", "ParamBrowRY")] {
         shape_warp(model, id, &[(p, &[-1.0, 0.0, 1.0])], |v, _, _| (0.0, -0.4 * at(v, 0)));
     }
@@ -759,20 +860,44 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
     }
     let turn: &[(&str, &[f32])] =
         &[("ParamAngleX", &[-30.0, 0.0, 30.0]), ("ParamAngleY", &[-30.0, 0.0, 30.0])];
-    shape_warp(model, "WarpHead", turn, |v, x, y| {
+    // the middle of the face travels further than its edges
+    let head_move = move |v: &[f32], x: f32, y: f32| {
         let (tx, ty) = (at(v, 0) / 30.0, at(v, 1) / 30.0);
-        // the middle of the face travels further than its edges
-        let dx = tx * (0.03 + 0.08 * (pi * x).sin());
-        let dy = -ty * (0.02 + 0.06 * (pi * y).sin());
-        (dx, dy)
-    });
+        (tx * (0.03 + 0.08 * (pi * x).sin()), -ty * (0.02 + 0.06 * (pi * y).sin()))
+    };
+    shape_warp(model, "WarpHead", turn, head_move);
+    // long hair follows the head where it lies on it, less and less below
+    // it, so no gap opens between it and the turned face
+    if let Some([hx0, hy0, hx1, hy1]) = head_grid {
+        let (hw, hh) = ((hx1 - hx0).max(1e-4), (hy1 - hy0).max(1e-4));
+        for &(id, [x0, y0, x1, y1]) in &long_grids {
+            let (w, h) = ((x1 - x0).max(1e-4), (y1 - y0).max(1e-4));
+            shape_warp(model, id, turn, |v, u, t| {
+                let (cx, cy) = (x0 + u * w, y0 + t * h);
+                let hu = ((cx - hx0) / hw).clamp(0.0, 1.0);
+                let hv = ((cy - hy0) / hh).clamp(0.0, 1.0);
+                let (dx, dy) = head_move(v, hu, hv);
+                let follow = 1.0 - ((cy - hy1) / (y1 - hy1).max(1e-4)).clamp(0.0, 1.0);
+                (dx * hw / w * follow, dy * hh / h * follow)
+            });
+        }
+    }
     shape_rotation(model, "RotHead", &[("ParamAngleZ", &[-30.0, 0.0, 30.0])], |v| -at(v, 0) / 3.0);
-    let lean: &[(&str, &[f32])] =
-        &[("ParamBodyAngleX", &[-10.0, 0.0, 10.0]), ("ParamBreath", &[0.0, 1.0])];
-    shape_warp(model, "WarpBody", lean, |v, _, y| {
-        let lean = 0.06 * at(v, 0) / 10.0 * (1.0 - y); // the hips stay put
-        let breath = -0.015 * at(v, 1) * (1.0 - y);
-        (lean, breath)
+    let lean: &[(&str, &[f32])] = &[
+        ("ParamBodyAngleX", &[-10.0, 0.0, 10.0]),
+        ("ParamBreath", &[0.0, 1.0]),
+        ("ParamBodyAngleY", &[-10.0, 0.0, 10.0]),
+        ("ParamBodyAngleZ", &[-10.0, 0.0, 10.0]),
+    ];
+    shape_warp(model, "WarpBody", lean, |v, x, y| {
+        let up = 1.0 - y; // the hips stay put
+        let lean = 0.06 * at(v, 0) / 10.0 * up;
+        let breath = -0.015 * at(v, 1) * up;
+        // bent back the chest rises, bent forward it sinks
+        let bend = -0.03 * at(v, 2) / 10.0 * up;
+        // tilted sideways the shoulders go over, the far one higher
+        let tz = BODY_TILT * at(v, 3) / 10.0;
+        (lean + 0.06 * tz * up, breath + bend + 0.04 * tz * (x - 0.5) * up)
     });
 
     let groups: Vec<PhysicsGroup> = [
@@ -829,42 +954,104 @@ mod tests {
         assert_eq!(k("line drawing"), None, "wing only at a word's start");
         let part =
             |names: &[&str]| eye_part(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(part(&["上まつ毛"]), EyePart::UpperLash);
-        assert_eq!(part(&["아래 속눈썹"]), EyePart::LowerLash);
-        assert_eq!(part(&["L", "白目"]), EyePart::Ball, "the folder says it");
-        assert_eq!(part(&["eye_L"]), EyePart::Other);
+        assert_eq!(part(&["上まつ毛"]), Part::UpperLash);
+        assert_eq!(part(&["아래 속눈썹"]), Part::LowerLash);
+        assert_eq!(part(&["eye lower lash L"]), Part::LowerLash);
+        assert_eq!(part(&["L", "白目"]), Part::White, "the folder says it");
+        assert_eq!(part(&["eye iris L"]), Part::Iris);
+        assert_eq!(part(&["eye_L"]), Part::Other);
+        assert!(says("mouth inside", INSIDE) && says("입 안", INSIDE));
+    }
+
+    /// Each drawn mesh's (mean x, mean y, opacity), in canvas pixels.
+    fn look(p: &ayatsuri_core::Puppet) -> Vec<(usize, f32, f32, f32)> {
+        p.drawables()
+            .map(|d| {
+                let (pairs, _) = d.positions.as_chunks::<2>();
+                let n = pairs.len().max(1) as f32;
+                let x = pairs.iter().map(|p| p[0]).sum::<f32>() / n;
+                let y = pairs.iter().map(|p| p[1]).sum::<f32>() / n;
+                (d.mesh, x * 600.0 + 200.0, y * 600.0 + 300.0, d.opacity)
+            })
+            .collect()
+    }
+
+    fn get(v: &[(usize, f32, f32, f32)], m: usize) -> Option<(f32, f32, f32)> {
+        v.iter().find(|x| x.0 == m).map(|x| (x.1, x.2, x.3))
     }
 
     #[test]
-    fn an_eye_in_parts_shuts_onto_its_lower_lash() {
+    fn an_eye_in_parts_shuts_its_lids_together_and_looks_about() {
         let (model, _, _) = rigged();
+        let (white, iris, upper, lower, highlight) = (4, 5, 6, 7, 8);
+        assert_eq!(model.art_meshes[iris].masks, [white as u32], "the white clips the iris");
+        assert_eq!(model.art_meshes[highlight].masks, [white as u32]);
         let mut puppet = ayatsuri_core::Puppet::new(model.clone());
         puppet.update();
-        // mesh index -> (mean y, opacity), in canvas pixels
-        let look = |p: &ayatsuri_core::Puppet| -> Vec<(usize, f32, f32)> {
-            p.drawables()
-                .map(|d| {
-                    let (pairs, _) = d.positions.as_chunks::<2>();
-                    let y = pairs.iter().map(|p| p[1]).sum::<f32>() / pairs.len().max(1) as f32;
-                    (d.mesh, y * 600.0 + 300.0, d.opacity)
-                })
-                .collect()
-        };
-        let get =
-            |v: &[(usize, f32, f32)], m: usize| v.iter().find(|x| x.0 == m).map(|x| (x.1, x.2));
         let open = look(&puppet);
         puppet.set_value(param(&model, "ParamEyeLOpen").unwrap(), 0.0);
         puppet.update();
         let shut = look(&puppet);
-        let (white, iris, upper, lower, highlight) = (4, 5, 6, 7, 8);
-        for ball in [white, iris, highlight] {
-            assert_eq!(get(&open, ball).map(|x| x.1), Some(1.0));
-            assert!(get(&shut, ball).is_none_or(|x| x.1 == 0.0), "the eyeball folds away");
+        let tall = |p: &ayatsuri_core::Puppet, m: usize| {
+            let d = p.drawables().find(|d| d.mesh == m).unwrap();
+            let (pairs, _) = d.positions.as_chunks::<2>();
+            let ys = pairs.iter().map(|p| p[1] * 600.0);
+            ys.clone().fold(f32::MIN, f32::max) - ys.fold(f32::MAX, f32::min)
+        };
+        assert!(tall(&puppet, white) < 0.5, "the white folds to a line, clipping the iris away");
+        let y = |v: &[_], m| get(v, m).unwrap().1;
+        assert!((y(&open, upper) - 188.0).abs() < 3.0, "{}", y(&open, upper));
+        assert!((y(&open, lower) - 213.0).abs() < 3.0, "{}", y(&open, lower));
+        // a quarter of the way up from the lower lash, both lids there
+        assert!((y(&shut, upper) - 207.0).abs() < 3.0, "{}", y(&shut, upper));
+        assert!((y(&shut, lower) - 207.0).abs() < 3.0, "{}", y(&shut, lower));
+
+        puppet.set_value(param(&model, "ParamEyeLOpen").unwrap(), 1.0);
+        puppet.set_value(param(&model, "ParamEyeBallX").unwrap(), 1.0);
+        puppet.update();
+        let right = look(&puppet);
+        let x = |v: &[_], m| get(v, m).unwrap().0;
+        // a quarter of the white's mesh (44 px of art, its outline round
+        // it) to the viewer's right; the white itself stays
+        for m in [iris, highlight] {
+            let d = x(&right, m) - x(&open, m);
+            assert!((10.0..17.0).contains(&d), "{m}: {d}");
         }
-        let (up_open, up_shut) = (get(&open, upper).unwrap().0, get(&shut, upper).unwrap().0);
-        assert!((up_open - 188.0).abs() < 3.0, "{up_open}");
-        assert!((up_shut - 213.0).abs() < 3.0, "the upper lash lands on the lower: {up_shut}");
-        assert_eq!(get(&open, lower), get(&shut, lower), "the lower lash stays");
+        assert_eq!(get(&right, white), get(&open, white));
+    }
+
+    #[test]
+    fn the_mouths_inside_shows_only_when_it_opens() {
+        let (model, _, r) = rigged();
+        let inside = 12;
+        assert_eq!(r[inside], Role::Mouth);
+        let mut puppet = ayatsuri_core::Puppet::new(model.clone());
+        puppet.update();
+        assert!(get(&look(&puppet), inside).is_none_or(|x| x.2 == 0.0));
+        puppet.set_value(param(&model, "ParamMouthOpenY").unwrap(), 1.0);
+        puppet.update();
+        assert_eq!(get(&look(&puppet), inside).map(|x| x.2), Some(1.0));
+    }
+
+    #[test]
+    fn the_body_tilts_the_way_the_head_does() {
+        let (model, _, _) = rigged();
+        let face = 3;
+        let mut puppet = ayatsuri_core::Puppet::new(model.clone());
+        puppet.update();
+        let rest = get(&look(&puppet), face).unwrap().0;
+        let shift = |puppet: &mut ayatsuri_core::Puppet, id: &str, v: f32| {
+            let p = param(&model, id).unwrap();
+            puppet.set_value(p, v);
+            puppet.update();
+            let x = get(&look(puppet), face).unwrap().0 - rest;
+            puppet.set_value(p, 0.0);
+            puppet.update();
+            x
+        };
+        let (head, body) =
+            (shift(&mut puppet, "ParamAngleZ", 30.0), shift(&mut puppet, "ParamBodyAngleZ", 10.0));
+        assert!(head.abs() > 1.0 && head.signum() == body.signum(), "{head} {body}");
     }
 
     /// A filled ellipse on a full-canvas layer.
@@ -912,6 +1099,7 @@ mod tests {
             blob("R", "eye", (160.0, 200.0, 22.0, 14.0), [40, 60, 120]),
             blob("brow l", "", (240.0, 170.0, 24.0, 5.0), [60, 40, 30]),
             blob("brow r", "", (160.0, 170.0, 24.0, 5.0), [60, 40, 30]),
+            blob("mouth inside", "", (200.0, 266.0, 16.0, 4.0), [90, 30, 40]),
             blob("mouth", "", (200.0, 265.0, 20.0, 6.0), [200, 70, 80]),
             blob("bangs", "Hair", (200.0, 110.0, 105.0, 45.0), [90, 55, 40]),
             // twintails: down to y 580, far past the face (y 80 to 320)
@@ -936,7 +1124,7 @@ mod tests {
             .collect();
         assert_eq!(automesh(&mut model, &pages), model.art_meshes.len(), "every layer meshes");
         let r = roles(&model, &imported.mesh_names, &imported.part_names);
-        let parts = eye_parts(&model, &r, &imported.mesh_names, &imported.part_names);
+        let parts = super::parts(&model, &r, &imported.mesh_names, &imported.part_names);
         rig(&mut model, &r, &parts).unwrap();
         (model, imported.textures, r)
     }
@@ -946,7 +1134,7 @@ mod tests {
         use Role::*;
         let (model, _, r) = rigged();
         let want = [HairBack, Body, Body, Face, EyeL, EyeL, EyeL, EyeL, EyeL, EyeR, BrowL, BrowR];
-        assert_eq!(r, [&want[..], &[Mouth, HairFront, HairSide, WingL, WingR]].concat());
+        assert_eq!(r, [&want[..], &[Mouth, Mouth, HairFront, HairSide, WingL, WingR]].concat());
         let mut puppet = ayatsuri_core::Puppet::new(model.clone());
         puppet.update();
         let snap = |p: &ayatsuri_core::Puppet| -> Vec<(usize, Vec<f32>)> {
@@ -963,32 +1151,40 @@ mod tests {
             let now = snap(&puppet);
             puppet.set_value(p, model.parameters[p].default);
             puppet.update();
-            let mut out: Vec<Role> = rest
+            // a mesh shown or hidden (the mouth's inside) counts as moved
+            let mut out: Vec<Role> = now
                 .iter()
-                .zip(&now)
-                .filter(|((_, a), (_, b))| a.iter().zip(b).any(|(x, y)| (x - y).abs() > 1e-4))
-                .map(|((m, _), _)| r[*m])
+                .filter(|(m, b)| {
+                    rest.iter()
+                        .find(|(x, _)| x == m)
+                        .is_none_or(|(_, a)| a.iter().zip(b).any(|(x, y)| (x - y).abs() > 1e-4))
+                })
+                .map(|(m, _)| r[*m])
                 .collect();
             out.sort_by_key(|x| *x as u8);
             out.dedup();
             out
         };
-        let head = vec![Face, EyeL, EyeR, BrowL, BrowR, Mouth, HairFront, HairBack];
         assert_eq!(moved("ParamEyeLOpen", 0.0), vec![EyeL]);
         assert_eq!(moved("ParamEyeROpen", 0.0), vec![EyeR]);
         assert_eq!(moved("ParamBrowLY", 1.0), vec![BrowL]);
         assert_eq!(moved("ParamMouthOpenY", 1.0), vec![Mouth]);
         assert_eq!(moved("ParamHairFront", 1.0), vec![HairFront]);
         assert_eq!(moved("ParamHairSide", 1.0), vec![HairSide]);
-        // the long twintails stay out of the turn but tilt with the head
-        assert_eq!(moved("ParamAngleX", 30.0), head);
+        assert_eq!(moved("ParamEyeBallX", 1.0), vec![EyeL], "the right eye has no iris");
+        // the long twintails stay out of the head warp but follow its turn
+        // at the top, and tilt with the head
         let tilted = vec![Face, EyeL, EyeR, BrowL, BrowR, Mouth, HairFront, HairSide, HairBack];
+        assert_eq!(moved("ParamAngleX", 30.0), tilted);
+        assert_eq!(moved("ParamAngleY", 30.0), tilted);
         assert_eq!(moved("ParamAngleZ", 30.0), tilted);
         // wings flap together and lean with the body, not with the head
         assert_eq!(moved("ParamWing", 1.0), vec![WingL, WingR]);
         let mut all = tilted.clone();
         all.extend([Body, WingL, WingR]);
-        assert_eq!(moved("ParamBodyAngleX", 10.0), all);
+        for id in ["ParamBodyAngleX", "ParamBodyAngleY", "ParamBodyAngleZ"] {
+            assert_eq!(moved(id, 10.0), all, "{id}");
+        }
         assert_eq!(model.physics.as_ref().map(|p| p.groups.len()), Some(4));
     }
 
