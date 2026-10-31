@@ -37,6 +37,8 @@ pub enum Role {
     HairSide,
     HairBack,
     Body,
+    WingL,
+    WingR,
 }
 
 impl Role {
@@ -52,6 +54,8 @@ impl Role {
             Role::HairSide => "hair side",
             Role::HairBack => "hair back",
             Role::Body => "body",
+            Role::WingL => "wing L",
+            Role::WingR => "wing R",
         }
     }
 }
@@ -64,15 +68,17 @@ enum Kind {
     Mouth,
     Hair,
     Face,
+    Wing,
     Body,
 }
 
 /// Checked in this order: lashes first (속눈썹 holds 눈썹), then brows
 /// before eyes (eyebrow, 눈썹 hold eye words), hair before face (머리카락
-/// holds 머리, head). ASCII words of four letters or more match inside a
-/// word ("eyebrows", "hairback"), shorter ones only at a word's start
-/// ("eyelid", "armor"), so "ear" is not found in "pearl" nor "arm" in
-/// "warm".
+/// holds 머리, head), wings before body ("body wing L" is a wing). ASCII
+/// words of four letters or more match inside a word ("eyebrows",
+/// "hairback"), shorter ones and those in [`AT_START`] only at a word's
+/// start ("eyelid", "armor", "wings"), so "ear" is not found in "pearl",
+/// "arm" in "warm" nor "wing" in "drawing".
 const WORDS: &[(Kind, &[&str])] = &[
     (Kind::Eye, &["속눈썹", "まつ毛", "まつげ"]),
     (Kind::Brow, &["brow", "眉", "まゆ", "눈썹"]),
@@ -89,6 +95,7 @@ const WORDS: &[(Kind, &[&str])] = &[
             "얼굴", "머리", "코", "귀", "볼",
         ],
     ),
+    (Kind::Wing, &["wing", "翼", "羽", "날개"]),
     (
         Kind::Body,
         &[
@@ -126,11 +133,15 @@ fn tokens(text: &str) -> Vec<String> {
     out
 }
 
+/// Long words that still only match at a word's start.
+const AT_START: &[&str] = &["wing"];
+
 fn has_word(text: &str, toks: &[String], word: &str) -> bool {
     if !word.is_ascii() {
         return text.contains(word);
     }
-    toks.iter().any(|t| if word.len() >= 4 { t.contains(word) } else { t.starts_with(word) })
+    let inside = word.len() >= 4 && !AT_START.contains(&word);
+    toks.iter().any(|t| if inside { t.contains(word) } else { t.starts_with(word) })
 }
 
 fn kind_of_text(text: &str) -> Option<Kind> {
@@ -328,6 +339,8 @@ pub fn roles(model: &Model, mesh_names: &[String], part_names: &[String]) -> Vec
                 Some((Kind::Mouth, _)) => Role::Mouth,
                 Some((Kind::Hair, t)) => hair_role(t),
                 Some((Kind::Face, _)) => Role::Face,
+                Some((Kind::Wing, _)) if mid_x > cx => Role::WingL,
+                Some((Kind::Wing, _)) => Role::WingR,
                 Some((Kind::Body, _)) => Role::Body,
                 // no word for it ("highlight", "sigil"): an eye's if it
                 // sits in one, else the face's if it sits on the face
@@ -340,22 +353,27 @@ pub fn roles(model: &Model, mesh_names: &[String], part_names: &[String]) -> Vec
         .collect()
 }
 
-/// id, min, default, max: Live2D's Standard Parameter List.
-const PARAMS: &[(&str, f32, f32, f32)] = &[
-    ("ParamAngleX", -30.0, 0.0, 30.0),
-    ("ParamAngleY", -30.0, 0.0, 30.0),
-    ("ParamAngleZ", -30.0, 0.0, 30.0),
-    ("ParamEyeLOpen", 0.0, 1.0, 1.0),
-    ("ParamEyeROpen", 0.0, 1.0, 1.0),
-    ("ParamBrowLY", -1.0, 0.0, 1.0),
-    ("ParamBrowRY", -1.0, 0.0, 1.0),
-    ("ParamMouthForm", -1.0, 0.0, 1.0),
-    ("ParamMouthOpenY", 0.0, 0.0, 1.0),
-    ("ParamBodyAngleX", -10.0, 0.0, 10.0),
-    ("ParamBreath", 0.0, 0.0, 1.0),
-    ("ParamHairFront", -1.0, 0.0, 1.0),
-    ("ParamHairSide", -1.0, 0.0, 1.0),
-    ("ParamHairBack", -1.0, 0.0, 1.0),
+/// id, min, default, max, and the roles it moves: made only when one of
+/// them is drawn, so no parameter is left dead. Live2D's Standard
+/// Parameter List, plus ParamWing. Face, eye and mouth ones are always
+/// made: trackers drive them and model3.json's EyeBlink and LipSync
+/// groups name them.
+const PARAMS: &[(&str, f32, f32, f32, &[Role])] = &[
+    ("ParamAngleX", -30.0, 0.0, 30.0, &[]),
+    ("ParamAngleY", -30.0, 0.0, 30.0, &[]),
+    ("ParamAngleZ", -30.0, 0.0, 30.0, &[]),
+    ("ParamEyeLOpen", 0.0, 1.0, 1.0, &[]),
+    ("ParamEyeROpen", 0.0, 1.0, 1.0, &[]),
+    ("ParamBrowLY", -1.0, 0.0, 1.0, &[Role::BrowL]),
+    ("ParamBrowRY", -1.0, 0.0, 1.0, &[Role::BrowR]),
+    ("ParamMouthForm", -1.0, 0.0, 1.0, &[]),
+    ("ParamMouthOpenY", 0.0, 0.0, 1.0, &[]),
+    ("ParamBodyAngleX", -10.0, 0.0, 10.0, &[]),
+    ("ParamBreath", 0.0, 0.0, 1.0, &[]),
+    ("ParamHairFront", -1.0, 0.0, 1.0, &[Role::HairFront]),
+    ("ParamHairSide", -1.0, 0.0, 1.0, &[Role::HairSide]),
+    ("ParamHairBack", -1.0, 0.0, 1.0, &[Role::HairBack]),
+    ("ParamWing", -1.0, 0.0, 1.0, &[Role::WingL, Role::WingR]),
 ];
 
 /// role, warp id, rows, cols
@@ -368,7 +386,12 @@ const FEATURES: &[(Role, &str, u32, u32)] = &[
     (Role::HairFront, "WarpHairFront", 3, 3),
     (Role::HairSide, "WarpHairSide", 3, 3),
     (Role::HairBack, "WarpHairBack", 3, 3),
+    (Role::WingL, "WarpWingL", 3, 3),
+    (Role::WingR, "WarpWingR", 3, 3),
 ];
+
+/// Wing warps hang on the body: a lean carries them, a head turn does not.
+const WINGS: &[&str] = &["WarpWingL", "WarpWingR"];
 
 fn param(model: &Model, id: &str) -> Option<usize> {
     model.parameters.iter().position(|p| p.id == id)
@@ -626,10 +649,11 @@ fn wrap(model: &mut Model, kind: NewDeformer, children: &[Child], id: &str) -> R
 
 /// Build the rig over `roles` (one per art mesh, from [`roles`]) and the
 /// eyes' `parts` (from [`eye_parts`]): the standard parameters, the
-/// deformer tree, the keyforms and hair physics.
+/// deformer tree, the keyforms and hair and wing physics.
 pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), String> {
-    for &(id, min, default, max) in PARAMS {
-        if param(model, id).is_none() {
+    let drawn = |any: &[Role]| any.is_empty() || roles.iter().any(|r| any.contains(r));
+    for &(id, min, default, max, moves) in PARAMS {
+        if drawn(moves) && param(model, id).is_none() {
             model.parameters.push(Parameter {
                 id: id.into(),
                 min,
@@ -683,7 +707,7 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
 
     // the head: a warp over the face and its features, a rotation over that
     let mut head: Vec<Child> = meshes(Role::Face).into_iter().map(Child::Mesh).collect();
-    let short = made.iter().filter(|id| !long.contains(id));
+    let short = made.iter().filter(|id| !long.contains(id) && !WINGS.contains(id));
     head.extend(short.filter_map(|id| deformer(model, id)).map(Child::Deformer));
     let mut body: Vec<Child> = meshes(Role::Body).into_iter().map(Child::Mesh).collect();
     if !head.is_empty() {
@@ -695,6 +719,8 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
         wrap(model, rotation, &turned, "RotHead")?;
         body.extend(deformer(model, "RotHead").map(Child::Deformer));
     }
+    // looked up only now: making the head deformers shifted every index
+    body.extend(WINGS.iter().filter_map(|id| deformer(model, id)).map(Child::Deformer));
     if !body.is_empty() {
         wrap(model, NewDeformer::Warp { rows: 4, cols: 4 }, &body, "WarpBody")?;
     }
@@ -721,6 +747,16 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
         // rooted at the top, the tips swing most
         shape_warp(model, id, &[(p, &[-1.0, 0.0, 1.0])], |v, _, y| (0.12 * at(v, 0) * y * y, 0.0));
     }
+    // wings flap as a pair: the root by the body stays, the far tip rises
+    // and tucks in. The left wing is on the viewer's right, its root at u 0.
+    for (id, root_at_left) in [("WarpWingL", true), ("WarpWingR", false)] {
+        shape_warp(model, id, &[("ParamWing", &[-1.0, 0.0, 1.0])], |v, x, _| {
+            let reach = if root_at_left { x } else { 1.0 - x };
+            let tuck = if root_at_left { -1.0 } else { 1.0 };
+            let f = at(v, 0) * reach * reach;
+            (tuck * 0.04 * f, -0.12 * f)
+        });
+    }
     let turn: &[(&str, &[f32])] =
         &[("ParamAngleX", &[-30.0, 0.0, 30.0]), ("ParamAngleY", &[-30.0, 0.0, 30.0])];
     shape_warp(model, "WarpHead", turn, |v, x, y| {
@@ -740,12 +776,13 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[EyePart]) -> Result<(), S
     });
 
     let groups: Vec<PhysicsGroup> = [
-        (Role::HairFront, "Hair Front", "ParamHairFront"),
-        (Role::HairSide, "Hair Side", "ParamHairSide"),
-        (Role::HairBack, "Hair Back", "ParamHairBack"),
+        (&[Role::HairFront][..], "Hair Front", "ParamHairFront"),
+        (&[Role::HairSide], "Hair Side", "ParamHairSide"),
+        (&[Role::HairBack], "Hair Back", "ParamHairBack"),
+        (&[Role::WingL, Role::WingR], "Wing", "ParamWing"),
     ]
     .iter()
-    .filter(|(r, _, _)| roles.contains(r))
+    .filter(|(any, _, _)| drawn(any))
     .enumerate()
     .map(|(n, &(_, name, out))| hair_physics(n + 1, name, out))
     .collect();
@@ -787,6 +824,9 @@ mod tests {
         assert_eq!(k("속눈썹"), Some(Kind::Eye), "an eyelash, not a brow");
         assert_eq!(k("eyelid_L"), Some(Kind::Eye));
         assert_eq!(k("armor"), Some(Kind::Body));
+        assert_eq!(k("body wing L"), Some(Kind::Wing), "a wing before the body word");
+        assert_eq!(k("날개"), Some(Kind::Wing));
+        assert_eq!(k("line drawing"), None, "wing only at a word's start");
         let part =
             |names: &[&str]| eye_part(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         assert_eq!(part(&["上まつ毛"]), EyePart::UpperLash);
@@ -876,12 +916,18 @@ mod tests {
             blob("bangs", "Hair", (200.0, 110.0, 105.0, 45.0), [90, 55, 40]),
             // twintails: down to y 580, far past the face (y 80 to 320)
             blob("side hair", "Hair", (200.0, 340.0, 130.0, 240.0), [90, 55, 40]),
+            blob("body wing L", "", (345.0, 420.0, 50.0, 90.0), [230, 230, 240]),
+            blob("body wing R", "", (55.0, 420.0, 50.0, 90.0), [230, 230, 240]),
         ];
         Document { width: 400, height: 600, layers, folders: vec![] }
     }
 
     pub(crate) fn rigged() -> (Model, Vec<Vec<u8>>, Vec<Role>) {
-        let imported = ayatsuri_import::from_layers_atlas(&doll()).unwrap();
+        rigged_from(&doll())
+    }
+
+    fn rigged_from(doc: &Document) -> (Model, Vec<Vec<u8>>, Vec<Role>) {
+        let imported = ayatsuri_import::from_layers_atlas(doc).unwrap();
         let mut model = imported.model;
         let pages: Vec<image::RgbaImage> = imported
             .textures
@@ -900,7 +946,7 @@ mod tests {
         use Role::*;
         let (model, _, r) = rigged();
         let want = [HairBack, Body, Body, Face, EyeL, EyeL, EyeL, EyeL, EyeL, EyeR, BrowL, BrowR];
-        assert_eq!(r, [&want[..], &[Mouth, HairFront, HairSide]].concat());
+        assert_eq!(r, [&want[..], &[Mouth, HairFront, HairSide, WingL, WingR]].concat());
         let mut puppet = ayatsuri_core::Puppet::new(model.clone());
         puppet.update();
         let snap = |p: &ayatsuri_core::Puppet| -> Vec<(usize, Vec<f32>)> {
@@ -938,10 +984,29 @@ mod tests {
         assert_eq!(moved("ParamAngleX", 30.0), head);
         let tilted = vec![Face, EyeL, EyeR, BrowL, BrowR, Mouth, HairFront, HairSide, HairBack];
         assert_eq!(moved("ParamAngleZ", 30.0), tilted);
+        // wings flap together and lean with the body, not with the head
+        assert_eq!(moved("ParamWing", 1.0), vec![WingL, WingR]);
         let mut all = tilted.clone();
-        all.push(Body);
+        all.extend([Body, WingL, WingR]);
         assert_eq!(moved("ParamBodyAngleX", 10.0), all);
-        assert_eq!(model.physics.as_ref().map(|p| p.groups.len()), Some(3));
+        assert_eq!(model.physics.as_ref().map(|p| p.groups.len()), Some(4));
+    }
+
+    #[test]
+    fn parameters_come_only_with_layers_to_move() {
+        let mut doc = doll();
+        doc.layers.retain(|l| {
+            !l.name.contains("brow") && !l.name.contains("side") && !l.name.contains("wing")
+        });
+        let (model, _, _) = rigged_from(&doc);
+        let ids: Vec<&str> = model.parameters.iter().map(|p| p.id.as_str()).collect();
+        for gone in ["ParamBrowLY", "ParamBrowRY", "ParamHairSide", "ParamWing"] {
+            assert!(!ids.contains(&gone), "{gone} would be dead");
+        }
+        for kept in ["ParamEyeLOpen", "ParamMouthOpenY", "ParamHairFront", "ParamHairBack"] {
+            assert!(ids.contains(&kept), "{kept}");
+        }
+        assert_eq!(model.physics.as_ref().map(|p| p.groups.len()), Some(2));
     }
 
     #[test]
