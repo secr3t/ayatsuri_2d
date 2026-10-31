@@ -177,6 +177,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ayatsuri-cli"
+version = "0.6.0"
+dependencies = [
+ "ayatsuri-core",
+ "ayatsuri-format",
+ "ayatsuri-import",
+ "image",
+ "serde_json",
+]
+
+[[package]]
 name = "ayatsuri-core"
 version = "0.6.0"
 dependencies = [

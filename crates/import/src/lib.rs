@@ -71,6 +71,13 @@ pub fn from_layers(doc: &Document) -> Result<Imported, ImportError> {
     layers::build(doc)
 }
 
+/// `from_layers` with the layers packed onto shared atlas pages, the way an
+/// export wants them (the headless CLI has no Make Atlas step after).
+#[cfg(feature = "documents")]
+pub fn from_layers_atlas(doc: &Document) -> Result<Imported, ImportError> {
+    layers::build_atlas(doc)
+}
+
 /// A Photoshop document as a fresh, rig-ready model.
 #[cfg(feature = "documents")]
 pub fn from_psd(bytes: &[u8]) -> Result<Imported, ImportError> {
