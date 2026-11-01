@@ -168,6 +168,10 @@ fn hair_role(text: &str) -> Role {
 /// highlight), which looks about; the mouth's inside shows only when it
 /// opens. An eye layer that says none of these (an eye drawn as one piece)
 /// is squashed whole.
+///
+/// The swaps are whole drawings of a shut or half shut eye or an open
+/// mouth: they hang on the head, bend with nothing else, and fade in over
+/// the parts as the parameter gets there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
     UpperLash,
@@ -175,6 +179,9 @@ pub enum Part {
     White,
     Iris,
     MouthInside,
+    EyeClosed,
+    EyeHalf,
+    MouthOpen,
     Other,
 }
 
@@ -186,10 +193,22 @@ impl Part {
             Part::White => "eye white",
             Part::Iris => "iris",
             Part::MouthInside => "inside",
+            Part::EyeClosed => "closed",
+            Part::EyeHalf => "half",
+            Part::MouthOpen => "open",
             Part::Other => "",
         }
     }
+
+    fn is_swap(self) -> bool {
+        matches!(self, Part::EyeClosed | Part::EyeHalf | Part::MouthOpen)
+    }
 }
+
+/// Half before shut: 半開き holds 開.
+const HALF: &[&str] = &["half", "半目", "半開", "반감", "반쯤"];
+const CLOSED: &[&str] = &["closed", "close", "shut", "閉", "감은", "감김", "닫힌"];
+const OPEN: &[&str] = &["open", "開", "벌린", "벌림", "열린"];
 
 const LASH: &[&str] =
     &["lash", "lid", "まつ毛", "まつげ", "睫", "瞼", "まぶた", "속눈썹", "눈꺼풀", "아이라인"];
@@ -221,6 +240,12 @@ fn says(text: &str, words: &[&str]) -> bool {
 /// The first name that says which eye part, layer name before folders.
 fn eye_part(names: &[String]) -> Part {
     for n in names {
+        if says(n, HALF) {
+            return Part::EyeHalf;
+        }
+        if says(n, CLOSED) {
+            return Part::EyeClosed;
+        }
         if says(n, LASH) {
             return if says(n, LOWER) { Part::LowerLash } else { Part::UpperLash };
         }
@@ -248,6 +273,7 @@ pub fn parts(
             let names = || names_of(model, i, mesh_names, part_names);
             match r {
                 Role::EyeL | Role::EyeR => eye_part(&names()),
+                Role::Mouth if names().iter().any(|n| says(n, OPEN)) => Part::MouthOpen,
                 Role::Mouth if names().iter().any(|n| says(n, INSIDE)) => Part::MouthInside,
                 _ => Part::Other,
             }
@@ -546,9 +572,25 @@ fn shape_mesh(
 fn shut_eyes(model: &mut Model, roles: &[Role], parts: &[Part]) {
     let sides = [(Role::EyeL, "ParamEyeLOpen"), (Role::EyeR, "ParamEyeROpen")];
     for (side, id) in sides {
-        let eye: Vec<usize> =
-            roles.iter().enumerate().filter(|&(_, &r)| r == side).map(|(i, _)| i).collect();
         let part = |i: usize| parts.get(i).copied().unwrap_or(Part::Other);
+        let all: Vec<usize> =
+            roles.iter().enumerate().filter(|&(_, &r)| r == side).map(|(i, _)| i).collect();
+        let (swaps, eye): (Vec<usize>, Vec<usize>) = all.iter().partition(|&&i| part(i).is_swap());
+        let has = |p: Part| swaps.iter().any(|&i| part(i) == p);
+        // drawn shut, the parts give way to the drawing from half open to
+        // a fifth; drawn half shut, that drawing shows from 0.35 to 0.65
+        let shut = |v: f32| ((0.5 - v) / 0.3).clamp(0.0, 1.0);
+        let half = |v: f32| (((v - 0.2) / 0.15).min((0.8 - v) / 0.15)).clamp(0.0, 1.0);
+        let swapped = has(Part::EyeClosed) || has(Part::EyeHalf);
+        let gone = move |v: f32| if has(Part::EyeClosed) { 1.0 - shut(v) } else { 1.0 };
+        let keys: &[f32] =
+            if swapped { &[0.0, 0.2, 0.35, 0.5, 0.65, 0.8, 1.0] } else { &[0.0, 0.5, 1.0] };
+        for &mi in &swaps {
+            let show = if part(mi) == Part::EyeClosed { shut } else { half };
+            shape_mesh(model, mi, &[(id, keys)], |v, pts| {
+                (pts.to_vec(), show(v.first().copied().unwrap_or(1.0)))
+            });
+        }
         let union = |model: &Model, pick: &dyn Fn(Part) -> bool| {
             eye.iter()
                 .filter(|&&i| pick(part(i)))
@@ -586,7 +628,6 @@ fn shut_eyes(model: &mut Model, roles: &[Role], parts: &[Part]) {
         let reach = white
             .or_else(|| union(model, &|_| true))
             .map_or((0.0, 0.0), |[x0, y0, x1, y1]| ((x1 - x0) * 0.25, (y1 - y0) * 0.2));
-        let keys: &[f32] = &[0.0, 0.5, 1.0];
         let gaze: &[f32] = &[-1.0, 0.0, 1.0];
         for &mi in &eye {
             match part(mi) {
@@ -634,17 +675,53 @@ fn shut_eyes(model: &mut Model, roles: &[Role], parts: &[Part]) {
                     });
                 }
             }
+            fade_mesh(model, mi, id, gone);
         }
     }
 }
 
-/// The mouth's inside shows only once the mouth opens.
-fn open_mouth(model: &mut Model, parts: &[Part]) {
-    let inside = parts.iter().enumerate().filter(|&(_, &p)| p == Part::MouthInside);
-    for (mi, _) in inside {
-        shape_mesh(model, mi, &[("ParamMouthOpenY", &[0.0, 0.3, 1.0])], |v, pts| {
-            (pts.to_vec(), if v.first().copied().unwrap_or(0.0) > 0.0 { 1.0 } else { 0.0 })
-        });
+/// Scale each of mesh `mi`'s keyform opacities by `f` of its value on `id`.
+fn fade_mesh(model: &mut Model, mi: usize, id: &str, f: impl Fn(f32) -> f32) -> Option<()> {
+    let p = param(model, id)?;
+    let m = model.art_meshes.get_mut(mi)?;
+    for k in 0..m.binding.keyform_count() {
+        let v = values_at(&m.binding, &[p], k).first().copied().unwrap_or(0.0);
+        if let Some(o) = m.opacities.get_mut(k) {
+            *o *= f(v);
+        }
+    }
+    Some(())
+}
+
+/// The mouth's inside shows only once the mouth opens. Drawn open, the
+/// mouth gives way to the drawing from 0.3 to 0.6.
+fn open_mouth(model: &mut Model, roles: &[Role], parts: &[Part]) {
+    let id = "ParamMouthOpenY";
+    let swapped = parts.contains(&Part::MouthOpen);
+    let open = |v: f32| ((v - 0.3) / 0.3).clamp(0.0, 1.0);
+    let keys: &[f32] = if swapped { &[0.0, 0.3, 0.6, 1.0] } else { &[0.0, 0.3, 1.0] };
+    for (mi, (&r, &p)) in roles.iter().zip(parts).enumerate() {
+        match p {
+            _ if r != Role::Mouth => continue,
+            Part::Other if swapped => {
+                shape_mesh(model, mi, &[(id, keys)], |_, pts| (pts.to_vec(), 1.0));
+            }
+            Part::MouthInside => {
+                shape_mesh(model, mi, &[(id, keys)], |v, pts| {
+                    (pts.to_vec(), if v.first().copied().unwrap_or(0.0) > 0.0 { 1.0 } else { 0.0 })
+                });
+            }
+            Part::MouthOpen => {
+                shape_mesh(model, mi, &[(id, keys)], |v, pts| {
+                    (pts.to_vec(), open(v.first().copied().unwrap_or(0.0)))
+                });
+                continue;
+            }
+            _ => continue,
+        }
+        if swapped {
+            fade_mesh(model, mi, id, |v| 1.0 - open(v));
+        }
     }
 }
 
@@ -793,10 +870,12 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[Part]) -> Result<(), Stri
         .filter_map(|&(role, id)| union(model, &|r| r == role).map(|b| (id, grid(b))))
         .collect();
 
-    // the feature warps, straight over their meshes
+    // the feature warps, straight over their meshes; the swap drawings
+    // stay out of them and only turn with the head
+    let swap = |i: &usize| parts.get(*i).is_some_and(|p| p.is_swap());
     let mut made: Vec<&str> = Vec::new();
     for &(role, id, rows, cols) in FEATURES {
-        let ms = meshes(role);
+        let ms: Vec<usize> = meshes(role).into_iter().filter(|i| !swap(i)).collect();
         if ms.is_empty() {
             continue;
         }
@@ -807,6 +886,7 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[Part]) -> Result<(), Stri
 
     // the head: a warp over the face and its features, a rotation over that
     let mut head: Vec<Child> = meshes(Role::Face).into_iter().map(Child::Mesh).collect();
+    head.extend((0..roles.len()).filter(swap).map(Child::Mesh));
     let short = made.iter().filter(|id| !long.iter().any(|(_, l)| l == *id) && !WINGS.contains(id));
     head.extend(short.filter_map(|id| deformer(model, id)).map(Child::Deformer));
     let mut body: Vec<Child> = meshes(Role::Body).into_iter().map(Child::Mesh).collect();
@@ -829,7 +909,7 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[Part]) -> Result<(), Stri
     let pi = std::f32::consts::PI;
     let at = |v: &[f32], i: usize| v.get(i).copied().unwrap_or(0.0);
     shut_eyes(model, roles, parts);
-    open_mouth(model, parts);
+    open_mouth(model, roles, parts);
     for (id, p) in [("WarpBrowL", "ParamBrowLY"), ("WarpBrowR", "ParamBrowRY")] {
         shape_warp(model, id, &[(p, &[-1.0, 0.0, 1.0])], |v, _, _| (0.0, -0.4 * at(v, 0)));
     }
@@ -960,6 +1040,10 @@ mod tests {
         assert_eq!(part(&["L", "白目"]), Part::White, "the folder says it");
         assert_eq!(part(&["eye iris L"]), Part::Iris);
         assert_eq!(part(&["eye_L"]), Part::Other);
+        assert_eq!(part(&["eye closed L"]), Part::EyeClosed);
+        assert_eq!(part(&["目 半開き"]), Part::EyeHalf, "half before 開");
+        assert_eq!(part(&["감은 눈"]), Part::EyeClosed);
+        assert!(says("mouth open", OPEN) && says("口 開き", OPEN) && says("벌린 입", OPEN));
         assert!(says("mouth inside", INSIDE) && says("입 안", INSIDE));
     }
 
@@ -1031,6 +1115,48 @@ mod tests {
         puppet.set_value(param(&model, "ParamMouthOpenY").unwrap(), 1.0);
         puppet.update();
         assert_eq!(get(&look(&puppet), inside).map(|x| x.2), Some(1.0));
+    }
+
+    #[test]
+    fn swap_drawings_fade_in_over_the_parts_and_bend_with_the_head_only() {
+        let mut doc = doll();
+        doc.layers.push(blob("eye closed L", "", (240.0, 200.0, 27.0, 18.0), [240, 200, 190]));
+        doc.layers.push(blob("mouth open", "", (200.0, 268.0, 22.0, 10.0), [150, 40, 50]));
+        let (model, _, _) = rigged_from(&doc);
+        let n = doc.layers.len();
+        let (closed, open, white, lash, mouth) = (n - 2, n - 1, 4, 6, 13);
+        let warp_head = deformer(&model, "WarpHead").map(|d| d as u32);
+        for m in [closed, open] {
+            assert_eq!(model.art_meshes[m].parent_deformer, warp_head, "{m}");
+        }
+        let mut puppet = ayatsuri_core::Puppet::new(model.clone());
+        let at = |puppet: &mut ayatsuri_core::Puppet, id: &str, v: f32| {
+            puppet.set_value(param(&model, id).unwrap(), v);
+            puppet.update();
+            look(puppet)
+        };
+        let opa = |v: &[_], m| get(v, m).map_or(0.0, |x| x.2);
+        let eye = "ParamEyeLOpen";
+        let o = at(&mut puppet, eye, 1.0);
+        assert_eq!((opa(&o, closed), opa(&o, white), opa(&o, lash)), (0.0, 1.0, 1.0));
+        let half = at(&mut puppet, eye, 0.35);
+        assert!((opa(&half, closed) - 0.5).abs() < 0.01 && (opa(&half, white) - 0.5).abs() < 0.01);
+        let s = at(&mut puppet, eye, 0.0);
+        assert_eq!((opa(&s, closed), opa(&s, white), opa(&s, lash)), (1.0, 0.0, 0.0));
+        let still = |a: &[_], b: &[_], m| {
+            let (a, b) = (get(a, m).unwrap(), get(b, m).unwrap());
+            (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01
+        };
+        assert!(still(&s, &half, closed), "the shut drawing does not bend");
+        at(&mut puppet, eye, 1.0);
+        let m = "ParamMouthOpenY";
+        let shut = at(&mut puppet, m, 0.0);
+        assert_eq!((opa(&shut, open), opa(&shut, mouth)), (0.0, 1.0));
+        let mid = at(&mut puppet, m, 0.45);
+        assert!((opa(&mid, open) - 0.5).abs() < 0.01 && (opa(&mid, mouth) - 0.5).abs() < 0.01);
+        let wide = at(&mut puppet, m, 1.0);
+        assert_eq!((opa(&wide, open), opa(&wide, mouth)), (1.0, 0.0));
+        assert!(still(&wide, &mid, open), "nor the open one");
     }
 
     #[test]
