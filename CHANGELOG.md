@@ -31,6 +31,16 @@
   leaves that action with no key, its default included, so a default such
   as Ctrl+R for Auto connect edges no longer fires by accident. Reset
   brings the default back.
+- **Headless CLI, `ayatsuri-cli`**: `roles` shows which face part each
+  layer of a PSD, KRA or CLIP file is taken for, by its name and its
+  folders' names (English, Japanese and Korean). `rig` meshes every layer,
+  builds Cubism's standard rig over them (head and body angles, eyes with
+  gaze and clipping, swap drawings for shut eyes and an open mouth, brows,
+  mouth, hair and wings with physics, breath) and writes a moc3 bundle.
+  `bust` wraps one mesh of a finished moc3 in a warp that lifts and swells
+  the chest: ellipses or a grey mask for where, a parameter for each side,
+  a lift direction and a root for each ellipse; `--dry` writes the moc3
+  back unchanged to check the round trip.
 
 ### Fixed
 

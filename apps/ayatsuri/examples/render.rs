@@ -79,6 +79,15 @@ fn main() -> Result<(), String> {
     println!("{} textures", textures.len());
 
     let mut puppet = ayatsuri_core::Puppet::new(model);
+    // SET=ParamAngleX=30,ParamEyeLOpen=0 poses the model first
+    for pair in std::env::var("SET").unwrap_or_default().split(',') {
+        let Some((id, v)) = pair.split_once('=') else { continue };
+        let p = puppet.model().parameters.iter().position(|q| q.id == id);
+        match (p, v.parse::<f32>()) {
+            (Some(p), Ok(v)) => puppet.set_value(p, v),
+            _ => eprintln!("SET: no parameter {id} or bad value {v}"),
+        }
+    }
     puppet.update();
 
     if std::env::var_os("LIST_DRAWS").is_some() {
@@ -200,7 +209,13 @@ fn main() -> Result<(), String> {
                     } else {
                         sample(tex, u, v)
                     };
-                    let a = src[3] * d.opacity;
+                    let clip = if masked {
+                        let c = coverage.get(py * out_w + px).copied().unwrap_or(0.0);
+                        if inverted { 1.0 - c } else { c }
+                    } else {
+                        1.0
+                    };
+                    let a = src[3] * d.opacity * clip;
                     if a <= 0.003 {
                         continue;
                     }
