@@ -1007,57 +1007,175 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[Part]) -> Result<(), Stri
     Ok(())
 }
 
-/// How `bust` shapes a chest: a soft ellipse on the warp's grid (0 to 1)
-/// that rises and swells as the parameter goes up and sinks and narrows,
-/// at 0.6 of the reach, as it goes down.
-pub struct Bust {
+/// A soft ellipse on the bust warp's grid (0 to 1), `gain` times as
+/// strong as the rest, moved by `param`.
+pub struct Ellipse {
     pub center: [f32; 2],
     pub radius: [f32; 2],
+    pub gain: f32,
+    pub param: String,
+}
+
+/// What stays put as the chest swells up and down.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pivot {
+    Center,
+    Bottom,
+    Top,
+}
+
+/// How `bust` shapes a chest: where the ellipses and the mask (a grey
+/// image over the canvas, white moves) weigh most, it rises and swells as
+/// their parameter goes up and sinks and narrows, at 0.6 of the reach, as
+/// it goes down. Overlapping weights take the larger, not the sum.
+pub struct Bust {
+    pub ellipses: Vec<Ellipse>,
+    pub mask: Option<(image::GrayImage, String)>,
+    pub pivot: Pivot,
     pub lift: f32,
     pub swell: f32,
     pub rows: u32,
     pub cols: u32,
 }
 
-impl Default for Bust {
-    fn default() -> Self {
-        Bust { center: [0.5, 0.4], radius: [0.35, 0.2], lift: 0.03, swell: 0.05, rows: 8, cols: 8 }
-    }
+/// One weight over the grid's points, with its middle and its top and
+/// bottom in grid heights.
+struct Weight {
+    param: String,
+    at: Vec<f32>,
+    center: [f32; 2],
+    top: f32,
+    bottom: f32,
+}
+
+/// Where the warp `create_warp_deformer` makes over mesh `mi` lies on the
+/// canvas, in pixels: the mesh's rest bounds and 5% about them.
+fn canvas_grid(model: &Model, mi: usize) -> Option<Box4> {
+    let mut puppet = ayatsuri_core::Puppet::new(model.clone());
+    puppet.update();
+    let c = model.canvas;
+    let d = puppet.drawables().find(|d| d.mesh == mi)?;
+    let (pairs, _) = d.positions.as_chunks::<2>();
+    let [x0, y0, x1, y1] = pairs.iter().fold(None, |b, &[x, y]| Some(grow(b, [x, y, x, y])))?;
+    let px = |x: f32| c.origin_x + x * c.pixels_per_unit;
+    let py = |y: f32| c.origin_y + y * c.pixels_per_unit;
+    let (x0, y0, x1, y1) = (px(x0), py(y0), px(x1), py(y1));
+    let (mx, my) = ((x1 - x0) * 0.05, (y1 - y0) * 0.05);
+    Some([x0 - mx, y0 - my, x1 + mx, y1 + my])
 }
 
 /// Wrap art mesh `mesh` of a finished model in a new warp, "WarpBust",
-/// under the mesh's own parent, and key it on `param` at -1, 0 and 1,
-/// the parameter made (-1 to 1) if the model has none.
-pub fn bust(model: &mut Model, mesh: &str, param_id: &str, b: &Bust) -> Result<(), String> {
+/// under the mesh's own parent, and key it at -1, 0 and 1 on each
+/// parameter `b` names, each parameter moving only its own weights. A
+/// parameter the model lacks is made, -1 to 1.
+pub fn bust(model: &mut Model, mesh: &str, b: &Bust) -> Result<(), String> {
     const ID: &str = "WarpBust";
     if deformer(model, ID).is_some() {
         return Err(format!("the model has a {ID} already"));
     }
     let mi = model.art_meshes.iter().position(|m| m.id == mesh).ok_or(format!("no mesh {mesh}"))?;
-    if param(model, param_id).is_none() {
-        model.parameters.push(Parameter {
-            id: param_id.into(),
-            min: -1.0,
-            max: 1.0,
-            default: 0.0,
-            repeat: false,
-            decimals: 1,
-            blend_shape: false,
-        });
+    let (rows, cols) = (b.rows.clamp(1, 64) as usize, b.cols.clamp(1, 64) as usize);
+    let grid: Vec<[f32; 2]> = (0..=rows)
+        .flat_map(|r| (0..=cols).map(move |c| [c as f32 / cols as f32, r as f32 / rows as f32]))
+        .collect();
+
+    let mut weights: Vec<Weight> = b
+        .ellipses
+        .iter()
+        .map(|e| {
+            let ([cu, cv], [ru, rv]) = (e.center, e.radius.map(|r| r.max(1e-4)));
+            let at = grid
+                .iter()
+                .map(|&[u, v]| {
+                    let d = ((u - cu) / ru).hypot((v - cv) / rv);
+                    if d < 1.0 { e.gain * (1.0 - d).powi(2) * (1.0 + 2.0 * d) } else { 0.0 }
+                })
+                .collect();
+            Weight { param: e.param.clone(), at, center: e.center, top: cv - rv, bottom: cv + rv }
+        })
+        .collect();
+    if let Some((img, param)) = &b.mask {
+        let [x0, y0, x1, y1] = canvas_grid(model, mi).ok_or(format!("{mesh} is not drawn"))?;
+        let c = model.canvas;
+        let (sx, sy) =
+            (img.width() as f32 / c.width.max(1.0), img.height() as f32 / c.height.max(1.0));
+        let at: Vec<f32> = grid
+            .iter()
+            .map(|&[u, v]| {
+                let (x, y) = ((x0 + u * (x1 - x0)) * sx, (y0 + v * (y1 - y0)) * sy);
+                if x < 0.0 || y < 0.0 {
+                    return 0.0;
+                }
+                img.get_pixel_checked(x as u32, y as u32).map_or(0.0, |p| f32::from(p.0[0]) / 255.0)
+            })
+            .collect();
+        let total: f32 = at.iter().sum();
+        if total <= 0.0 {
+            return Err("the mask is black over the mesh".into());
+        }
+        let mean = |i: usize| {
+            grid.iter().zip(&at).map(|(g, w)| g.get(i).copied().unwrap_or(0.0) * w).sum::<f32>()
+                / total
+        };
+        let lit = || grid.iter().zip(&at).filter(|&(_, &w)| w > 0.01).map(|(g, _)| g[1]);
+        let (top, bottom) = (lit().fold(1.0, f32::min), lit().fold(0.0, f32::max));
+        let center = [mean(0), mean(1)];
+        weights.push(Weight { param: param.clone(), at, center, top, bottom });
     }
-    edit::create_warp_deformer(model, &[mi], b.rows, b.cols, ID.into())
+    let mut params: Vec<&str> = Vec::new();
+    for w in &weights {
+        if !params.contains(&w.param.as_str()) {
+            params.push(&w.param);
+        }
+    }
+    if params.is_empty() {
+        return Err("nothing to move: give an ellipse or a mask".into());
+    }
+    for id in &params {
+        if param(model, id).is_none() {
+            model.parameters.push(Parameter {
+                id: (*id).into(),
+                min: -1.0,
+                max: 1.0,
+                default: 0.0,
+                repeat: false,
+                decimals: 1,
+                blend_shape: false,
+            });
+        }
+    }
+
+    edit::create_warp_deformer(model, &[mi], rows as u32, cols as u32, ID.into())
         .ok_or(format!("{mesh} cannot take a warp"))?;
-    let ([cu, cv], [ru, rv]) = (b.center, b.radius.map(|r| r.max(1e-4)));
-    shape_warp(model, ID, &[(param_id, &[-1.0, 0.0, 1.0])], |vals, u, v| {
-        let val = vals.first().copied().unwrap_or(0.0);
-        let d = ((u - cu) / ru).hypot((v - cv) / rv);
-        let w = if d < 1.0 { (1.0 - d).powi(2) * (1.0 + 2.0 * d) } else { 0.0 };
-        // down, the same moves at 0.6; a negative swell narrows (up is -y)
-        let k = if val > 0.0 { val } else { 0.6 * val };
-        let (lift, swell) = (b.lift * w * k, b.swell * w * k);
-        ((u - cu) * swell, -lift + (v - cv) * swell)
+    let axes: Vec<(&str, &[f32])> = params.iter().map(|&p| (p, &[-1.0, 0.0, 1.0][..])).collect();
+    shape_warp(model, ID, &axes, |vals, u, v| {
+        let i =
+            (v * rows as f32).round() as usize * (cols + 1) + (u * cols as f32).round() as usize;
+        let (mut dx, mut dy) = (0.0, 0.0);
+        for (&p, &val) in params.iter().zip(vals) {
+            // the strongest weight of this parameter here moves the point
+            let Some((w, s)) = weights
+                .iter()
+                .filter(|w| w.param == p)
+                .filter_map(|s| s.at.get(i).map(|&w| (w, s)))
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+            else {
+                continue;
+            };
+            // down, the same moves at 0.6; a negative swell narrows (up is -y)
+            let k = if val > 0.0 { val } else { 0.6 * val };
+            let (lift, swell) = (b.lift * w * k, b.swell * w * k);
+            let pv = match b.pivot {
+                Pivot::Center => s.center[1],
+                Pivot::Bottom => s.bottom,
+                Pivot::Top => s.top,
+            };
+            dx += (u - s.center[0]) * swell;
+            dy += -lift + (v - pv) * swell;
+        }
+        (dx, dy)
     })
-    .ok_or(format!("{ID} cannot be keyed on {param_id}"))
+    .ok_or(format!("{ID} cannot be keyed"))
 }
 
 #[cfg(test)]
@@ -1403,8 +1521,9 @@ mod tests {
         let body = roles.iter().position(|&r| r == Role::Body).unwrap();
         let id = model.art_meshes[body].id.clone();
         let parent = model.art_meshes[body].parent_deformer;
-        bust(&mut model, &id, "ParamBustY", &Bust::default()).unwrap();
-        assert!(bust(&mut model, &id, "ParamBustY", &Bust::default()).is_err(), "only one");
+        let one = || chest(vec![oval([0.5, 0.4], [0.35, 0.2], "ParamBustY")]);
+        bust(&mut model, &id, &one()).unwrap();
+        assert!(bust(&mut model, &id, &one()).is_err(), "only one");
 
         let di = deformer(&model, "WarpBust").unwrap();
         let warp = &model.deformers[di];
@@ -1445,5 +1564,93 @@ mod tests {
         };
         assert_eq!(shape(&back), shape(&model));
         assert_eq!(back.deformers.len(), model.deformers.len());
+    }
+
+    fn oval(center: [f32; 2], radius: [f32; 2], param: &str) -> Ellipse {
+        Ellipse { center, radius, gain: 1.0, param: param.into() }
+    }
+
+    fn chest(ellipses: Vec<Ellipse>) -> Bust {
+        Bust {
+            ellipses,
+            mask: None,
+            pivot: Pivot::Center,
+            lift: 0.03,
+            swell: 0.05,
+            rows: 8,
+            cols: 8,
+        }
+    }
+
+    /// The doll, through a moc3, with its body mesh wrapped by `b`; the
+    /// WarpBust keyforms' y of each grid point, and the body's index.
+    fn busted(b: &Bust) -> (Model, Vec<Vec<f32>>) {
+        let (model, _, roles) = rigged();
+        let moc = ayatsuri_import::to_moc3(&model, ayatsuri_import::ExportVersion::DEFAULT);
+        let mut model = ayatsuri_import::from_moc3(&moc.unwrap()).unwrap();
+        let body = roles.iter().position(|&r| r == Role::Body).unwrap();
+        let id = model.art_meshes[body].id.clone();
+        bust(&mut model, &id, b).unwrap();
+        let w = &model.deformers[deformer(&model, "WarpBust").unwrap()];
+        let DeformerKind::Warp(w) = &w.kind else { panic!() };
+        let ys = w
+            .positions
+            .chunks(81 * 2)
+            .map(|f| f.iter().skip(1).step_by(2).copied().collect())
+            .collect();
+        (model, ys)
+    }
+
+    #[test]
+    fn two_ellipses_on_two_parameters_each_move_their_own_side() {
+        let (model, ys) = busted(&chest(vec![
+            oval([0.25, 0.375], [0.2, 0.2], "ParamBustLY"),
+            oval([0.75, 0.375], [0.2, 0.2], "ParamBustRY"),
+        ]));
+        assert!(param(&model, "ParamBustLY").is_some() && param(&model, "ParamBustRY").is_some());
+        assert_eq!(ys.len(), 9, "3 keys on each of 2 axes");
+        // first axis fastest: rest is (0, 0) at 4, L up at 5, R up at 7
+        let (rest, l_up, r_up) = (&ys[4], &ys[5], &ys[7]);
+        let (l, r, between) = (3 * 9 + 2, 3 * 9 + 6, 3 * 9 + 4);
+        assert!(l_up[l] < rest[l] && l_up[r] == rest[r], "L moves only the left");
+        assert!(r_up[r] < rest[r] && r_up[l] == rest[l], "R moves only the right");
+        assert!(l_up[between] == rest[between] && r_up[between] == rest[between]);
+    }
+
+    #[test]
+    fn a_mask_weighs_the_grid_where_it_lies_on_the_canvas() {
+        let (model, _, roles) = rigged();
+        let body = roles.iter().position(|&r| r == Role::Body).unwrap();
+        let [x0, y0, x1, y1] = canvas_grid(&model, body).unwrap();
+        let c = model.canvas;
+        // the body blob is drawn about (200, 470) on the canvas
+        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        assert!((cx - 200.0).abs() < 10.0 && (cy - 470.0).abs() < 10.0, "{x0} {y0} {x1} {y1}");
+        // white over the grid's left half only, at half the canvas's size
+        let mid = (x0 + x1) / 2.0;
+        let mask = image::GrayImage::from_fn(c.width as u32 / 2, c.height as u32 / 2, |x, _| {
+            image::Luma([if (x as f32 * 2.0) < mid { 255 } else { 0 }])
+        });
+        let mut b = chest(vec![]);
+        b.mask = Some((mask, "ParamBustY".into()));
+        let (_, ys) = busted(&b);
+        let (rest, up) = (&ys[1], &ys[2]);
+        let (left, right) = (4 * 9 + 2, 4 * 9 + 6);
+        assert!(up[left] < rest[left], "white lifts");
+        assert_eq!(up[right], rest[right], "black stays");
+    }
+
+    #[test]
+    fn a_bottom_pivot_holds_the_bottom_and_lifts_the_top_further() {
+        let shaped = |pivot| {
+            let mut b = chest(vec![oval([0.5, 0.5], [0.6, 0.6], "ParamBustY")]);
+            (b.pivot, b.lift) = (pivot, 0.0);
+            let (_, ys) = busted(&b);
+            ys.iter().map(|f| f[4 * 9 + 4] - ys[1][4 * 9 + 4]).collect::<Vec<_>>()
+        };
+        // the middle point, swelling only: still about the centre, up
+        // about the bottom, down about the top
+        let (c, b, t) = (shaped(Pivot::Center), shaped(Pivot::Bottom), shaped(Pivot::Top));
+        assert!(c[2].abs() < 1e-4 && b[2] < -1e-4 && t[2] > 1e-4, "{c:?} {b:?} {t:?}");
     }
 }

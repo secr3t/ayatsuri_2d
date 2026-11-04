@@ -5,6 +5,8 @@
 //!
 //!     ayatsuri-cli bust  <model.model3.json|model.moc3> <out.moc3> [--mesh ID]
 //!                        [--param ID] [--center U,V] [--radius RU,RV]
+//!                        [--ellipse U,V,RU,RV[,W] [--param ID]]... [--mask PNG]
+//!                        [--mask-param ID] [--pivot center|bottom|top]
 //!                        [--lift F] [--swell F] [--rows N] [--cols N] [--dry]
 //!
 //! `roles` prints what each layer was taken for, to check the layer names
@@ -28,11 +30,25 @@ const USAGE: &str = "usage:
   ayatsuri-cli rig   <art.psd|art.kra|art.clip> <out-dir> [--name NAME] [--no-mesh]
   ayatsuri-cli bust  <model.model3.json|model.moc3> <out.moc3> [--mesh ArtMeshTopwear]
                      [--param ParamBustY] [--center 0.5,0.4] [--radius 0.35,0.2]
+                     [--ellipse U,V,RU,RV[,W] [--param ID]]... [--mask grey.png]
+                     [--mask-param ID] [--pivot center|bottom|top]
                      [--lift 0.03] [--swell 0.05] [--rows 8] [--cols 8] [--dry]";
 
 /// The options that take a value; the rest are flags.
 const VALUED: &[&str] = &[
-    "--name", "--mesh", "--param", "--center", "--radius", "--lift", "--swell", "--rows", "--cols",
+    "--name",
+    "--mesh",
+    "--param",
+    "--center",
+    "--radius",
+    "--lift",
+    "--swell",
+    "--rows",
+    "--cols",
+    "--ellipse",
+    "--mask",
+    "--mask-param",
+    "--pivot",
 ];
 
 fn main() {
@@ -63,7 +79,7 @@ fn run() -> Result<(), String> {
     let (cmd, input) = (next().ok_or(USAGE)?, next().ok_or(USAGE)?);
     if cmd == "bust" {
         let out = next().ok_or(USAGE)?;
-        return bust(&input, &out, &option, flag("--dry"));
+        return bust(&input, &out, &args, &option, flag("--dry"));
     }
 
     let path = Path::new(&input);
@@ -117,47 +133,107 @@ fn run() -> Result<(), String> {
 fn bust(
     input: &str,
     out: &str,
+    args: &[String],
     option: &dyn Fn(&str) -> Option<String>,
     dry: bool,
 ) -> Result<(), String> {
     let at = |e: std::io::Error| format!("{input}: {e}");
     let path = Path::new(input);
-    let moc_path = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("moc3")) {
-        path.to_path_buf()
+    let read = std::fs::read(path).map_err(at)?;
+    // a moc3 by its magic, whatever its name ends in
+    let (bytes, moc_path) = if read.starts_with(b"MOC3") {
+        (read, path.to_path_buf())
     } else {
-        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(at)?)
-            .map_err(|e| format!("{input}: {e}"))?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&read).map_err(|e| format!("{input}: {e}"))?;
         let moc = json
             .pointer("/FileReferences/Moc")
             .and_then(|m| m.as_str())
             .ok_or(format!("{input}: no FileReferences.Moc"))?;
-        path.parent().unwrap_or(Path::new("")).join(moc)
+        let p = path.parent().unwrap_or(Path::new("")).join(moc);
+        (std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?, p)
     };
-    let bytes = std::fs::read(&moc_path).map_err(|e| format!("{}: {e}", moc_path.display()))?;
     let mut model =
         ayatsuri_import::from_moc3(&bytes).map_err(|e| format!("{}: {e}", moc_path.display()))?;
-    let number = |f: &str, d: f32| -> Result<f32, String> {
-        option(f).map_or(Ok(d), |s| s.parse().map_err(|_| format!("{f}: not a number: {s}")))
-    };
+    let float =
+        |f: &str, s: &str| s.trim().parse::<f32>().map_err(|_| format!("{f}: not a number: {s}"));
+    let number = |f: &str, d: f32| option(f).map_or(Ok(d), |s| float(f, &s));
+    let floats =
+        |f: &str, s: &str| s.split(',').map(|x| float(f, x)).collect::<Result<Vec<f32>, _>>();
     let pair = |f: &str, d: [f32; 2]| -> Result<[f32; 2], String> {
         let Some(s) = option(f) else { return Ok(d) };
-        let bad = || format!("{f}: want A,B, got {s}");
-        let (a, b) = s.split_once(',').ok_or_else(bad)?;
-        Ok([a.trim().parse().map_err(|_| bad())?, b.trim().parse().map_err(|_| bad())?])
+        match floats(f, &s)?.as_slice() {
+            &[a, b] => Ok([a, b]),
+            _ => Err(format!("{f}: want A,B, got {s}")),
+        }
     };
-    let d = rig::Bust::default();
+
+    // each --ellipse takes the --param right after it; one --param alone
+    // moves them all
+    let mut ellipses: Vec<rig::Ellipse> = Vec::new();
+    let mut own: Vec<Option<String>> = Vec::new();
+    let mut params = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--ellipse" => {
+                let s = it.next().ok_or("--ellipse: want U,V,RU,RV[,W]")?;
+                let (center, radius, gain) = match *floats(a, s)?.as_slice() {
+                    [u, v, ru, rv] => ([u, v], [ru, rv], 1.0),
+                    [u, v, ru, rv, w] => ([u, v], [ru, rv], w),
+                    _ => return Err(format!("--ellipse: want U,V,RU,RV[,W], got {s}")),
+                };
+                ellipses.push(rig::Ellipse { center, radius, gain, param: String::new() });
+                own.push(None);
+            }
+            "--param" => {
+                let p = it.next().ok_or("--param: want an id")?.clone();
+                if let Some(slot @ None) = own.last_mut() {
+                    *slot = Some(p.clone());
+                }
+                params.push(p);
+            }
+            _ => {}
+        }
+    }
+    let first = params.first().cloned().unwrap_or_else(|| "ParamBustY".into());
+    for (e, p) in ellipses.iter_mut().zip(own) {
+        e.param = if params.len() > 1 { p.unwrap_or_else(|| first.clone()) } else { first.clone() };
+    }
+    let mask = match option("--mask") {
+        Some(m) => {
+            let img = image::open(&m).map_err(|e| format!("{m}: {e}"))?;
+            let param = option("--mask-param").unwrap_or_else(|| first.clone());
+            Some((img.to_luma8(), param))
+        }
+        None => None,
+    };
+    if (ellipses.is_empty() && mask.is_none())
+        || option("--center").is_some()
+        || option("--radius").is_some()
+    {
+        let center = pair("--center", [0.5, 0.4])?;
+        let radius = pair("--radius", [0.35, 0.2])?;
+        ellipses.push(rig::Ellipse { center, radius, gain: 1.0, param: first.clone() });
+    }
+    let pivot = match option("--pivot").as_deref() {
+        None | Some("center") => rig::Pivot::Center,
+        Some("bottom") => rig::Pivot::Bottom,
+        Some("top") => rig::Pivot::Top,
+        Some(p) => return Err(format!("--pivot: want center, bottom or top, got {p}")),
+    };
     let shape = rig::Bust {
-        center: pair("--center", d.center)?,
-        radius: pair("--radius", d.radius)?,
-        lift: number("--lift", d.lift)?,
-        swell: number("--swell", d.swell)?,
-        rows: number("--rows", d.rows as f32)? as u32,
-        cols: number("--cols", d.cols as f32)? as u32,
+        ellipses,
+        mask,
+        pivot,
+        lift: number("--lift", 0.03)?,
+        swell: number("--swell", 0.05)?,
+        rows: number("--rows", 8.0)? as u32,
+        cols: number("--cols", 8.0)? as u32,
     };
     if !dry {
         let mesh = option("--mesh").unwrap_or_else(|| "ArtMeshTopwear".into());
-        let param = option("--param").unwrap_or_else(|| "ParamBustY".into());
-        rig::bust(&mut model, &mesh, &param, &shape)?;
+        rig::bust(&mut model, &mesh, &shape)?;
     }
     let version = ayatsuri_import::ExportVersion::DEFAULT;
     for w in ayatsuri_import::export_warnings(&model, version) {
