@@ -3,10 +3,17 @@
 //!     ayatsuri-cli roles <art.psd|art.kra|art.clip>
 //!     ayatsuri-cli rig   <art.psd|art.kra|art.clip> <out-dir> [--name NAME] [--no-mesh]
 //!
+//!     ayatsuri-cli bust  <model.model3.json|model.moc3> <out.moc3> [--mesh ID]
+//!                        [--param ID] [--center U,V] [--radius RU,RV]
+//!                        [--lift F] [--swell F] [--rows N] [--cols N] [--dry]
+//!
 //! `roles` prints what each layer was taken for, to check the layer names
 //! before rigging. `rig` meshes every layer, builds the standard rig over
 //! them (see rig.rs) and writes NAME.moc3, NAME.model3.json,
-//! NAME.physics3.json and NAME.textures/ into out-dir.
+//! NAME.physics3.json and NAME.textures/ into out-dir. `bust` wraps one
+//! mesh of a finished moc3 in a warp keyed to lift and swell the chest
+//! (rig::bust) and writes only the new moc3; `--dry` writes it unchanged,
+//! to check what the round trip keeps.
 
 #![forbid(unsafe_code)]
 
@@ -18,7 +25,15 @@ use serde_json::json;
 
 const USAGE: &str = "usage:
   ayatsuri-cli roles <art.psd|art.kra|art.clip>
-  ayatsuri-cli rig   <art.psd|art.kra|art.clip> <out-dir> [--name NAME] [--no-mesh]";
+  ayatsuri-cli rig   <art.psd|art.kra|art.clip> <out-dir> [--name NAME] [--no-mesh]
+  ayatsuri-cli bust  <model.model3.json|model.moc3> <out.moc3> [--mesh ArtMeshTopwear]
+                     [--param ParamBustY] [--center 0.5,0.4] [--radius 0.35,0.2]
+                     [--lift 0.03] [--swell 0.05] [--rows 8] [--cols 8] [--dry]";
+
+/// The options that take a value; the rest are flags.
+const VALUED: &[&str] = &[
+    "--name", "--mesh", "--param", "--center", "--radius", "--lift", "--swell", "--rows", "--cols",
+];
 
 fn main() {
     if let Err(e) = run() {
@@ -31,11 +46,25 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let option = |f: &str| args.iter().skip_while(|a| *a != f).nth(1).cloned();
-    let mut plain = args.iter().filter(|a| !a.starts_with("--"));
-    // --name's value is not a positional argument
+    // an option's value is not a positional argument
+    let mut plain = args
+        .iter()
+        .enumerate()
+        .filter(|&(i, a)| {
+            !a.starts_with("--")
+                && !i
+                    .checked_sub(1)
+                    .and_then(|j| args.get(j))
+                    .is_some_and(|o| VALUED.contains(&o.as_str()))
+        })
+        .map(|(_, a)| a);
     let named = option("--name");
-    let mut next = || plain.find(|a| Some(*a) != named.as_ref()).cloned();
+    let mut next = || plain.next().cloned();
     let (cmd, input) = (next().ok_or(USAGE)?, next().ok_or(USAGE)?);
+    if cmd == "bust" {
+        let out = next().ok_or(USAGE)?;
+        return bust(&input, &out, &option, flag("--dry"));
+    }
 
     let path = Path::new(&input);
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -80,6 +109,68 @@ fn run() -> Result<(), String> {
     for w in written {
         println!("wrote {w}");
     }
+    Ok(())
+}
+
+/// `bust`: read the moc3 a model3.json names (or a moc3), shape its chest
+/// unless `dry`, and write the moc3 to `out`.
+fn bust(
+    input: &str,
+    out: &str,
+    option: &dyn Fn(&str) -> Option<String>,
+    dry: bool,
+) -> Result<(), String> {
+    let at = |e: std::io::Error| format!("{input}: {e}");
+    let path = Path::new(input);
+    let moc_path = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("moc3")) {
+        path.to_path_buf()
+    } else {
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(at)?)
+            .map_err(|e| format!("{input}: {e}"))?;
+        let moc = json
+            .pointer("/FileReferences/Moc")
+            .and_then(|m| m.as_str())
+            .ok_or(format!("{input}: no FileReferences.Moc"))?;
+        path.parent().unwrap_or(Path::new("")).join(moc)
+    };
+    let bytes = std::fs::read(&moc_path).map_err(|e| format!("{}: {e}", moc_path.display()))?;
+    let mut model =
+        ayatsuri_import::from_moc3(&bytes).map_err(|e| format!("{}: {e}", moc_path.display()))?;
+    let number = |f: &str, d: f32| -> Result<f32, String> {
+        option(f).map_or(Ok(d), |s| s.parse().map_err(|_| format!("{f}: not a number: {s}")))
+    };
+    let pair = |f: &str, d: [f32; 2]| -> Result<[f32; 2], String> {
+        let Some(s) = option(f) else { return Ok(d) };
+        let bad = || format!("{f}: want A,B, got {s}");
+        let (a, b) = s.split_once(',').ok_or_else(bad)?;
+        Ok([a.trim().parse().map_err(|_| bad())?, b.trim().parse().map_err(|_| bad())?])
+    };
+    let d = rig::Bust::default();
+    let shape = rig::Bust {
+        center: pair("--center", d.center)?,
+        radius: pair("--radius", d.radius)?,
+        lift: number("--lift", d.lift)?,
+        swell: number("--swell", d.swell)?,
+        rows: number("--rows", d.rows as f32)? as u32,
+        cols: number("--cols", d.cols as f32)? as u32,
+    };
+    if !dry {
+        let mesh = option("--mesh").unwrap_or_else(|| "ArtMeshTopwear".into());
+        let param = option("--param").unwrap_or_else(|| "ParamBustY".into());
+        rig::bust(&mut model, &mesh, &param, &shape)?;
+    }
+    let version = ayatsuri_import::ExportVersion::DEFAULT;
+    for w in ayatsuri_import::export_warnings(&model, version) {
+        eprintln!("warning: {w}");
+    }
+    let moc = ayatsuri_import::to_moc3(&model, version).map_err(|e| e.to_string())?;
+    std::fs::write(out, &moc).map_err(|e| format!("{out}: {e}"))?;
+    println!(
+        "{} parameters, {} deformers, {} meshes; wrote {out}",
+        model.parameters.len(),
+        model.deformers.len(),
+        model.art_meshes.len()
+    );
     Ok(())
 }
 

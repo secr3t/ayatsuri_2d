@@ -1007,6 +1007,59 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[Part]) -> Result<(), Stri
     Ok(())
 }
 
+/// How `bust` shapes a chest: a soft ellipse on the warp's grid (0 to 1)
+/// that rises and swells as the parameter goes up and sinks and narrows,
+/// at 0.6 of the reach, as it goes down.
+pub struct Bust {
+    pub center: [f32; 2],
+    pub radius: [f32; 2],
+    pub lift: f32,
+    pub swell: f32,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+impl Default for Bust {
+    fn default() -> Self {
+        Bust { center: [0.5, 0.4], radius: [0.35, 0.2], lift: 0.03, swell: 0.05, rows: 8, cols: 8 }
+    }
+}
+
+/// Wrap art mesh `mesh` of a finished model in a new warp, "WarpBust",
+/// under the mesh's own parent, and key it on `param` at -1, 0 and 1,
+/// the parameter made (-1 to 1) if the model has none.
+pub fn bust(model: &mut Model, mesh: &str, param_id: &str, b: &Bust) -> Result<(), String> {
+    const ID: &str = "WarpBust";
+    if deformer(model, ID).is_some() {
+        return Err(format!("the model has a {ID} already"));
+    }
+    let mi = model.art_meshes.iter().position(|m| m.id == mesh).ok_or(format!("no mesh {mesh}"))?;
+    if param(model, param_id).is_none() {
+        model.parameters.push(Parameter {
+            id: param_id.into(),
+            min: -1.0,
+            max: 1.0,
+            default: 0.0,
+            repeat: false,
+            decimals: 1,
+            blend_shape: false,
+        });
+    }
+    edit::create_warp_deformer(model, &[mi], b.rows, b.cols, ID.into())
+        .ok_or(format!("{mesh} cannot take a warp"))?;
+    let ([cu, cv], [ru, rv]) = (b.center, b.radius.map(|r| r.max(1e-4)));
+    shape_warp(model, ID, &[(param_id, &[-1.0, 0.0, 1.0])], |vals, u, v| {
+        let val = vals.first().copied().unwrap_or(0.0);
+        let d = ((u - cu) / ru).hypot((v - cv) / rv);
+        let w = if d < 1.0 { (1.0 - d).powi(2) * (1.0 + 2.0 * d) } else { 0.0 };
+        // down, the same moves at 0.6; a negative swell narrows (up is -y)
+        let k = if val > 0.0 { val } else { 0.6 * val };
+        let (lift, swell) = (b.lift * w * k, b.swell * w * k);
+        ((u - cu) * swell, -lift + (v - cv) * swell)
+    })
+    .ok_or(format!("{ID} cannot be keyed on {param_id}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,5 +1393,57 @@ mod tests {
         assert_eq!(back.parameters.len(), model.parameters.len());
         assert_eq!(back.deformers.len(), model.deformers.len());
         assert_eq!(back.art_meshes.len(), model.art_meshes.len());
+    }
+
+    #[test]
+    fn a_bust_warp_lifts_and_swells_the_chest_and_survives_a_round_trip() {
+        let (model, _, roles) = rigged();
+        let moc = |m: &Model| ayatsuri_import::to_moc3(m, ayatsuri_import::ExportVersion::DEFAULT);
+        let mut model = ayatsuri_import::from_moc3(&moc(&model).unwrap()).unwrap();
+        let body = roles.iter().position(|&r| r == Role::Body).unwrap();
+        let id = model.art_meshes[body].id.clone();
+        let parent = model.art_meshes[body].parent_deformer;
+        bust(&mut model, &id, "ParamBustY", &Bust::default()).unwrap();
+        assert!(bust(&mut model, &id, "ParamBustY", &Bust::default()).is_err(), "only one");
+
+        let di = deformer(&model, "WarpBust").unwrap();
+        let warp = &model.deformers[di];
+        assert_eq!(warp.parent_deformer, parent, "under the mesh's old parent");
+        assert_eq!(model.art_meshes[body].parent_deformer, Some(di as u32));
+        let DeformerKind::Warp(w) = &warp.kind else { panic!() };
+        let per = 81 * 2;
+        let form = |k: usize| &w.positions[k * per..(k + 1) * per];
+        // the grid point at (0.5, 0.375), in the ellipse's middle
+        let mid = (3 * 9 + 4) * 2;
+        let (low, rest, high) = (form(0), form(1), form(2));
+        assert!(
+            high[mid + 1] < rest[mid + 1] && low[mid + 1] > rest[mid + 1],
+            "up at 1, down at -1"
+        );
+        // a point off the middle goes out at 1 and in at -1
+        let side = (3 * 9 + 6) * 2;
+        assert!(high[side] > rest[side] && low[side] < rest[side]);
+        // the corners stay put
+        assert_eq!(&high[..2], &rest[..2]);
+
+        let back = ayatsuri_import::from_moc3(&moc(&model).unwrap()).unwrap();
+        let ids = |m: &Model| m.parameters.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&back), ids(&model));
+        assert!(ids(&back).contains(&"ParamBustY".to_string()));
+        let shape = |m: &Model| {
+            m.art_meshes
+                .iter()
+                .map(|a| {
+                    (
+                        a.id.clone(),
+                        a.binding.keyform_count(),
+                        a.masks.clone(),
+                        a.draw_orders.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&back), shape(&model));
+        assert_eq!(back.deformers.len(), model.deformers.len());
     }
 }
