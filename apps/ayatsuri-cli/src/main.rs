@@ -5,7 +5,8 @@
 //!
 //!     ayatsuri-cli bust  <model.model3.json|model.moc3> <out.moc3> [--mesh ID]
 //!                        [--param ID] [--center U,V] [--radius RU,RV]
-//!                        [--ellipse U,V,RU,RV[,W] [--param ID]]... [--mask PNG]
+//!                        [--ellipse U,V,RU,RV[,W] [--param ID] [--dir DX,DY]
+//!                        [--anchor U,V]]... [--mask PNG]
 //!                        [--mask-param ID] [--pivot center|bottom|top]
 //!                        [--lift F] [--swell F] [--rows N] [--cols N] [--dry]
 //!
@@ -30,7 +31,8 @@ const USAGE: &str = "usage:
   ayatsuri-cli rig   <art.psd|art.kra|art.clip> <out-dir> [--name NAME] [--no-mesh]
   ayatsuri-cli bust  <model.model3.json|model.moc3> <out.moc3> [--mesh ArtMeshTopwear]
                      [--param ParamBustY] [--center 0.5,0.4] [--radius 0.35,0.2]
-                     [--ellipse U,V,RU,RV[,W] [--param ID]]... [--mask grey.png]
+                     [--ellipse U,V,RU,RV[,W] [--param ID] [--dir DX,DY] [--anchor U,V]]...
+                     [--mask grey.png]
                      [--mask-param ID] [--pivot center|bottom|top]
                      [--lift 0.03] [--swell 0.05] [--rows 8] [--cols 8] [--dry]";
 
@@ -49,6 +51,8 @@ const VALUED: &[&str] = &[
     "--mask",
     "--mask-param",
     "--pivot",
+    "--dir",
+    "--anchor",
 ];
 
 fn main() {
@@ -62,6 +66,10 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let option = |f: &str| args.iter().skip_while(|a| *a != f).nth(1).cloned();
+    if flag("--help") || flag("-h") {
+        println!("{USAGE}");
+        return Ok(());
+    }
     // an option's value is not a positional argument
     let mut plain = args
         .iter()
@@ -183,8 +191,29 @@ fn bust(
                     [u, v, ru, rv, w] => ([u, v], [ru, rv], w),
                     _ => return Err(format!("--ellipse: want U,V,RU,RV[,W], got {s}")),
                 };
-                ellipses.push(rig::Ellipse { center, radius, gain, param: String::new() });
+                ellipses.push(rig::Ellipse {
+                    center,
+                    radius,
+                    gain,
+                    param: String::new(),
+                    dir: rig::UP,
+                    anchor: None,
+                });
                 own.push(None);
+            }
+            "--dir" | "--anchor" => {
+                let s = it.next().ok_or(format!("{a}: want A,B"))?;
+                let Some(e) = ellipses.last_mut() else {
+                    return Err(format!("{a} {s}: give it after an --ellipse"));
+                };
+                let &[x, y] = floats(a, s)?.as_slice() else {
+                    return Err(format!("{a}: want A,B, got {s}"));
+                };
+                if a == "--dir" {
+                    e.dir = [x, y];
+                } else {
+                    e.anchor = Some([x, y]);
+                }
             }
             "--param" => {
                 let p = it.next().ok_or("--param: want an id")?.clone();
@@ -214,7 +243,14 @@ fn bust(
     {
         let center = pair("--center", [0.5, 0.4])?;
         let radius = pair("--radius", [0.35, 0.2])?;
-        ellipses.push(rig::Ellipse { center, radius, gain: 1.0, param: first.clone() });
+        ellipses.push(rig::Ellipse {
+            center,
+            radius,
+            gain: 1.0,
+            param: first.clone(),
+            dir: rig::UP,
+            anchor: None,
+        });
     }
     let pivot = match option("--pivot").as_deref() {
         None | Some("center") => rig::Pivot::Center,

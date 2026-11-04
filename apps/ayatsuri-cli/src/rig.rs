@@ -1008,13 +1008,20 @@ pub fn rig(model: &mut Model, roles: &[Role], parts: &[Part]) -> Result<(), Stri
 }
 
 /// A soft ellipse on the bust warp's grid (0 to 1), `gain` times as
-/// strong as the rest, moved by `param`.
+/// strong as the rest, moved by `param`. It lifts along `dir` (grid units,
+/// up is -y; its length does not count) and swells out from `anchor`, the
+/// chest's root, or where the pivot says if none.
 pub struct Ellipse {
     pub center: [f32; 2],
     pub radius: [f32; 2],
     pub gain: f32,
     pub param: String,
+    pub dir: [f32; 2],
+    pub anchor: Option<[f32; 2]>,
 }
+
+/// Straight up the grid, the way a chest lifts facing front.
+pub const UP: [f32; 2] = [0.0, -1.0];
 
 /// What stays put as the chest swells up and down.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1046,6 +1053,8 @@ struct Weight {
     center: [f32; 2],
     top: f32,
     bottom: f32,
+    dir: [f32; 2],
+    anchor: Option<[f32; 2]>,
 }
 
 /// Where the warp `create_warp_deformer` makes over mesh `mi` lies on the
@@ -1091,7 +1100,17 @@ pub fn bust(model: &mut Model, mesh: &str, b: &Bust) -> Result<(), String> {
                     if d < 1.0 { e.gain * (1.0 - d).powi(2) * (1.0 + 2.0 * d) } else { 0.0 }
                 })
                 .collect();
-            Weight { param: e.param.clone(), at, center: e.center, top: cv - rv, bottom: cv + rv }
+            let len = e.dir[0].hypot(e.dir[1]);
+            let dir = if len > 1e-6 { e.dir.map(|d| d / len) } else { UP };
+            Weight {
+                param: e.param.clone(),
+                at,
+                center: e.center,
+                top: cv - rv,
+                bottom: cv + rv,
+                dir,
+                anchor: e.anchor,
+            }
         })
         .collect();
     if let Some((img, param)) = &b.mask {
@@ -1120,7 +1139,15 @@ pub fn bust(model: &mut Model, mesh: &str, b: &Bust) -> Result<(), String> {
         let lit = || grid.iter().zip(&at).filter(|&(_, &w)| w > 0.01).map(|(g, _)| g[1]);
         let (top, bottom) = (lit().fold(1.0, f32::min), lit().fold(0.0, f32::max));
         let center = [mean(0), mean(1)];
-        weights.push(Weight { param: param.clone(), at, center, top, bottom });
+        weights.push(Weight {
+            param: param.clone(),
+            at,
+            center,
+            top,
+            bottom,
+            dir: UP,
+            anchor: None,
+        });
     }
     let mut params: Vec<&str> = Vec::new();
     for w in &weights {
@@ -1165,13 +1192,16 @@ pub fn bust(model: &mut Model, mesh: &str, b: &Bust) -> Result<(), String> {
             // down, the same moves at 0.6; a negative swell narrows (up is -y)
             let k = if val > 0.0 { val } else { 0.6 * val };
             let (lift, swell) = (b.lift * w * k, b.swell * w * k);
-            let pv = match b.pivot {
-                Pivot::Center => s.center[1],
-                Pivot::Bottom => s.bottom,
-                Pivot::Top => s.top,
-            };
-            dx += (u - s.center[0]) * swell;
-            dy += -lift + (v - pv) * swell;
+            let [au, av] = s.anchor.unwrap_or_else(|| {
+                let pv = match b.pivot {
+                    Pivot::Center => s.center[1],
+                    Pivot::Bottom => s.bottom,
+                    Pivot::Top => s.top,
+                };
+                [s.center[0], pv]
+            });
+            dx += s.dir[0] * lift + (u - au) * swell;
+            dy += s.dir[1] * lift + (v - av) * swell;
         }
         (dx, dy)
     })
@@ -1567,7 +1597,7 @@ mod tests {
     }
 
     fn oval(center: [f32; 2], radius: [f32; 2], param: &str) -> Ellipse {
-        Ellipse { center, radius, gain: 1.0, param: param.into() }
+        Ellipse { center, radius, gain: 1.0, param: param.into(), dir: UP, anchor: None }
     }
 
     fn chest(ellipses: Vec<Ellipse>) -> Bust {
@@ -1652,5 +1682,50 @@ mod tests {
         // about the bottom, down about the top
         let (c, b, t) = (shaped(Pivot::Center), shaped(Pivot::Bottom), shaped(Pivot::Top));
         assert!(c[2].abs() < 1e-4 && b[2] < -1e-4 && t[2] > 1e-4, "{c:?} {b:?} {t:?}");
+    }
+
+    /// The doll through a moc3, and its body mesh's id.
+    fn doll_moc() -> (Model, String) {
+        let (model, _, roles) = rigged();
+        let moc = ayatsuri_import::to_moc3(&model, ayatsuri_import::ExportVersion::DEFAULT);
+        let model = ayatsuri_import::from_moc3(&moc.unwrap()).unwrap();
+        let body = roles.iter().position(|&r| r == Role::Body).unwrap();
+        let id = model.art_meshes[body].id.clone();
+        (model, id)
+    }
+
+    /// `doll` with mesh `id` wrapped by `b`, written out as a moc3, and the
+    /// WarpBust keyforms' grid points.
+    fn bust_moc((doll, id): &(Model, String), b: &Bust) -> (Vec<u8>, Vec<Vec<[f32; 2]>>) {
+        let mut model = doll.clone();
+        bust(&mut model, id, b).unwrap();
+        let w = &model.deformers[deformer(&model, "WarpBust").unwrap()];
+        let DeformerKind::Warp(w) = &w.kind else { panic!() };
+        let forms = w.positions.chunks(81 * 2).map(|f| f.as_chunks::<2>().0.to_vec()).collect();
+        let moc = ayatsuri_import::to_moc3(&model, ayatsuri_import::ExportVersion::DEFAULT);
+        (moc.unwrap(), forms)
+    }
+
+    #[test]
+    fn straight_up_from_the_pivot_is_what_no_dir_or_anchor_means() {
+        // one doll for both: rigging it again need not give the same bytes
+        let doll = doll_moc();
+        let (plain, _) = bust_moc(&doll, &chest(vec![oval([0.5, 0.4], [0.35, 0.2], "ParamBustY")]));
+        let mut e = oval([0.5, 0.4], [0.35, 0.2], "ParamBustY");
+        // any length up, and the ellipse's own centre as the root
+        (e.dir, e.anchor) = ([0.0, -3.0], Some([0.5, 0.4]));
+        let (spelt, _) = bust_moc(&doll, &chest(vec![e]));
+        assert!(plain == spelt, "the same moc3, byte for byte");
+    }
+
+    #[test]
+    fn a_sideways_dir_lifts_the_middle_sideways_only() {
+        let mut e = oval([0.5, 0.375], [0.35, 0.2], "ParamBustY");
+        e.dir = [1.0, 0.0];
+        let (_, forms) = bust_moc(&doll_moc(), &chest(vec![e]));
+        let mid = 3 * 9 + 4; // the grid point at the ellipse's centre
+        let ([rx, ry], [ux, uy]) = (forms[1][mid], forms[2][mid]);
+        assert!(ux > rx + 1e-4, "+x at 1: {rx} -> {ux}");
+        assert!((uy - ry).abs() < 1e-6, "no y: {ry} -> {uy}");
     }
 }
