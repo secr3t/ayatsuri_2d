@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Edit Mesh on several meshes** (#47): with several meshes picked, Edit
+  Mesh takes them all. The others show faintly, a click on one in the Move
+  mode edits it next, and Auto Mesh in the Edit Mesh dialog runs on all of
+  them. ArtMesh > Edit Mesh (Solo) does the same with everything else
+  hidden until it ends. Done or Cancel covers the whole session.
+- **Breath** (#50): the Breath button beside Follow makes the model idle in
+  the preview, as the Cubism SDK's breath does: each listed parameter moves
+  by (offset + peak * sin(2 pi t / cycle)) * weight, and physics reacts to
+  it. Right-click the button to choose the parameters and their numbers;
+  the SDK sample's set (angles, body angle and ParamBreath) is the default.
+  Only the preview moves: keyforms and exports are untouched.
+- **Delete edges by dragging** (#46): in Mesh Edit, a drag with the Delete
+  edge tool that starts off a point removes every edge and line it crosses,
+  marked red as it goes, in one undo step. The faces on those edges go and
+  the points stay.
+- **Pick a physics group's outputs as it is made**: Add group asks for a
+  name and the parameters the group drives, and marks any parameter another
+  group already drives, so two groups no longer fight over one output and
+  leave one seeming not to work.
+- **IDs when creating deformers and parameters** (#48): the New Deformer
+  dialog has an ID field beside the name, and both dialogs start from the
+  last ID made, counted on (Head_Rotation gives Head_Rotation2), so a run
+  of similar IDs needs one edit each. Spaces typed into an ID become `_`.
+- **Remove a shortcut**: the × beside a shortcut in Settings > Keyboard
+  leaves that action with no key, its default included, so a default such
+  as Ctrl+R for Auto connect edges no longer fires by accident. Reset
+  brings the default back.
+
+### Fixed
+
+- **The launcher starts the editor when its splash can't open** (#49): on
+  desktops that refuse the splash's transparent window, such as Linux Mint,
+  nothing started at all. The editor now starts without the splash.
+- **Edit Mesh no longer shifts the art after many edits**: a moved or
+  added point took its texture spot from the mesh as edited so far, so on
+  a mesh under a warp (or posed off its rest) each edit's small error fed
+  the next and the art drifted further the more was edited. The spot now
+  comes from the art as Mesh Edit shows it, read where the point is
+  actually drawn: under a bent warp a moved or added point lands a little
+  off the pointer, and reading the art at the pointer still shifted it a
+  pixel or two when Mesh Edit ended.
+- **Replicate parameters copies the whole pick**: with several parameters
+  picked it copied only the one right-clicked, and copies of parameters
+  with the same name came out with the same name too. It now copies each
+  picked parameter once, every copy's ID and name are new, and the copy
+  keeps its parameter's colour.
+- **Shortcuts no longer fire while typing**: in a text field such as
+  Rename only Save still works, since a capital letter is Shift+key and
+  Ctrl+Z or Ctrl+C belong to the field. While a dialog is open, keys
+  without Ctrl or Alt (the tool picks) stay quiet. The Edit Mesh panel is
+  not a dialog in this sense, so S (Solo) and the tool keys work in Mesh
+  Edit, and Solo there shows every mesh being edited.
+
 ## 0.6.0 (2026-10-29)
 
 Blend shapes, the feature promised for the end of October: on every kind

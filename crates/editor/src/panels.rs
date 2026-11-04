@@ -566,6 +566,9 @@ pub struct EditorUi {
     pub(crate) physics_on: bool,
     /// Drive the standard face/body/eye parameters from the cursor.
     follow_cursor: bool,
+    /// Breath in the preview: idle sine motion on a few parameters.
+    breath_on: bool,
+    breath: crate::breath::Breath,
     follow: Vec2,
     /// Cubism's edit level: 1 meshes, 2 deformers, 3 structure.
     edit_level: u8,
@@ -746,6 +749,10 @@ pub struct EditorUi {
     clip_also: Vec<usize>,
     /// A deformer creation requested from inside a borrow (canvas, tool pane).
     pending_create: Option<(bool, Option<(f32, f32)>)>,
+    /// The IDs of the parameter and the deformer made last: the next create
+    /// dialog starts from them, so a run of similar IDs needs one edit each.
+    last_param_id: Option<String>,
+    last_def_id: Option<String>,
     /// A guide line asked for from a menu, placed once the canvas is known.
     pending_guide: Option<GuideCmd>,
     /// Where the canvas was last right-clicked, for "add a guide here".
@@ -777,6 +784,17 @@ pub struct EditorUi {
     mesh_mode: u8,
     /// Points the erase brush has swept over during the current stroke.
     erase_marked: std::collections::BTreeSet<usize>,
+    /// The other meshes in this Mesh Edit session (several were selected on
+    /// entering): a click on one makes it the mesh edited, Auto Mesh runs
+    /// on all of them.
+    mesh_edit_also: Vec<usize>,
+    /// The solo that was on before an Edit Mesh (Solo) session, restored
+    /// when it ends.
+    mesh_edit_solo: Option<Option<std::collections::HashSet<String>>>,
+    /// The cut tool's drag: where the pointer was last frame, and the
+    /// edges and lines it has crossed so far (removed on release).
+    cut_sweep: Option<Pos2>,
+    cut_marked: std::collections::BTreeSet<(u16, u16)>,
     /// Mesh Edit's picked points (Select points mode), on `mesh_picked_on`.
     mesh_picked: std::collections::BTreeSet<usize>,
     mesh_picked_on: Option<usize>,
@@ -1005,6 +1023,44 @@ fn mesh_weights(pts: &[Pos2], indices: &[u16], p: Pos2) -> Option<([usize; 3], [
         }
     }
     best.map(|(_, t, w)| (t, w))
+}
+
+/// Mesh Edit's art as shown, on screen.
+fn art_screen(a: &MeshArt, to_screen: &impl Fn(f32, f32) -> Pos2) -> Vec<Pos2> {
+    a.positions.as_chunks::<2>().0.iter().map(|q| to_screen(q[0], q[1])).collect()
+}
+
+/// The texture coordinate of the art at screen point `p`: from the art's
+/// triangle there (carried on past its edge), or with no faces from any
+/// three of its points not in a line.
+fn art_uv(pts: &[Pos2], indices: &[u16], uvs: &[f32], p: Pos2) -> Option<(f32, f32)> {
+    (!indices.is_empty())
+        .then(|| mesh_weights(pts, indices, p))
+        .flatten()
+        .or_else(|| basis_weights(pts, p))
+        .and_then(|(t, w)| mix_uv(uvs, t, w))
+}
+
+/// The texture spot of each of `verts`, read from Mesh Edit's art where the
+/// point now draws (`drawn`, model units). A moved or added point's position
+/// goes through the parent deformer, so under a bent warp it lands a little
+/// off the pointer; its spot read at the pointer then showed the art from
+/// there, and the art shifted when Mesh Edit ended.
+fn art_spots_where_drawn(
+    art: &MeshArt,
+    drawn: &[f32],
+    verts: &[usize],
+) -> Vec<(usize, (f32, f32))> {
+    let pts: Vec<Pos2> =
+        art.positions.as_chunks::<2>().0.iter().map(|q| pos2(q[0], q[1])).collect();
+    verts
+        .iter()
+        .filter_map(|&v| {
+            let p = pos2(*drawn.get(v * 2)?, *drawn.get(v * 2 + 1)?);
+            Some((v, art_uv(&pts, &art.indices, &art.uvs, p)?))
+        })
+        .filter(|(_, (u, t))| u.is_finite() && t.is_finite())
+        .collect()
 }
 
 /// Blend a vertex pool's (u, v) pairs with triangle weights.
@@ -1705,6 +1761,8 @@ impl Default for EditorUi {
 
             physics_on: true,
             follow_cursor: false,
+            breath_on: false,
+            breath: Default::default(),
             follow: Vec2::ZERO,
             edit_level: 2,
             rebind: None,
@@ -1804,6 +1862,8 @@ impl Default for EditorUi {
             clip_pick: None,
             clip_also: Vec::new(),
             pending_create: None,
+            last_param_id: None,
+            last_def_id: None,
             pending_guide: None,
             ctx_click: None,
             ctx_layers: Vec::new(),
@@ -1826,6 +1886,10 @@ impl Default for EditorUi {
             mesh_clip_cmd: None,
             mesh_autoconnect: true,
             erase_marked: std::collections::BTreeSet::new(),
+            mesh_edit_also: Vec::new(),
+            mesh_edit_solo: None,
+            cut_sweep: None,
+            cut_marked: std::collections::BTreeSet::new(),
             pick_radius: 8.0,
             connect_rebuild: true,
             connect_protect: true,
@@ -2262,7 +2326,7 @@ impl EditorUi {
     /// frame. One comparison a frame and a line only on a change, so the
     /// log says what the user did without a line per frame.
     fn log_state_changes(&mut self) {
-        let states: [(&str, bool); 28] = [
+        let states: [(&str, bool); 29] = [
             ("Settings", self.show_settings),
             ("API window", self.show_api_window),
             ("Model Statistics", self.show_stats),
@@ -2288,6 +2352,7 @@ impl EditorUi {
             ("Mesh Edit", self.mesh_edit.is_some()),
             ("Physics", self.physics_on),
             ("Follow", self.follow_cursor),
+            ("Breath", self.breath_on),
             ("Temporary Deform Tool", self.tdeform.is_some()),
             ("Playlist playback", self.phys_page.pl_playing),
             ("Mirror Edit", self.mirror_edit),
@@ -2863,10 +2928,14 @@ impl EditorUi {
         crate::pen::apply_click_options(ui.ctx(), self.prefs.pen_mode);
         // shortcuts: the more modifiers a binding has, the earlier it gets a
         // look, so Ctrl+Shift+Z is taken before Ctrl+Z and Ctrl+1 before 1.
-        // Plain-key bindings stay quiet while a text field has the keyboard,
-        // and everything waits while Settings is capturing a new binding.
+        // While a text field has the keyboard only Save gets through: a
+        // capital letter is Shift+key and Ctrl+Z or Ctrl+C belong to the
+        // field, so any other binding would fire while typing a name. With
+        // a dialog open, keys with no Ctrl or Alt (tool picks) stay quiet.
+        // Everything waits while Settings is capturing a new binding.
         if self.rebind.is_none() {
             let typing = ui.ctx().egui_wants_keyboard_input();
+            let dialog = crate::windows::dialog_shown_lately(ui.ctx());
             let weight = |m: egui::Modifiers| {
                 usize::from(m.command || m.ctrl) + usize::from(m.shift) + usize::from(m.alt)
             };
@@ -2880,7 +2949,10 @@ impl EditorUi {
                 (std::cmp::Reverse(weight(sc.modifiers)), !(anim_first && id.starts_with("anim-")))
             });
             for (id, sc) in bound {
-                if typing && weight(sc.modifiers) == 0 {
+                if typing && !shortcut_while_typing(id) {
+                    continue;
+                }
+                if dialog && !(sc.modifiers.command || sc.modifiers.ctrl || sc.modifiers.alt) {
                     continue;
                 }
                 // S keys the parameter in Animation; Solo is a modeling view
@@ -3615,10 +3687,22 @@ impl EditorUi {
                         {
                             ui.close();
                             if let Some(Sel::Mesh(mi)) = self.selected {
-                                self.mesh_edit = Some(mi);
-                                self.mesh_drag = None;
-                                self.mesh_snapshot =
-                                    self.session.as_ref().map(|s| s.puppet.model().clone());
+                                self.enter_mesh_edit(mi, false);
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                mesh_sel,
+                                egui::Button::new(crate::i18n::tr("Edit Mesh (Solo)")),
+                            )
+                            .on_hover_text(crate::i18n::tr(
+                                "Edit the selected meshes with everything else hidden",
+                            ))
+                            .clicked()
+                        {
+                            ui.close();
+                            if let Some(Sel::Mesh(mi)) = self.selected {
+                                self.enter_mesh_edit(mi, true);
                             }
                         }
                         if ui
@@ -4101,6 +4185,22 @@ impl EditorUi {
                     self.follow_cursor = !self.follow_cursor;
                     log::debug!("follow cursor {}", if self.follow_cursor { "on" } else { "off" });
                 }
+                let breath_btn = ui
+                    .selectable_label(self.breath_on, crate::i18n::tr("Breath"))
+                    .on_hover_text(crate::i18n::tr(
+                        "Idle breathing in the preview; right-click to choose the parameters",
+                    ));
+                if breath_btn.clicked() {
+                    self.breath_on = !self.breath_on;
+                    log::debug!("breath {}", if self.breath_on { "on" } else { "off" });
+                    if !self.breath_on
+                        && let Some(s) = &mut self.session
+                    {
+                        self.breath.stop(&mut s.puppet);
+                        s.dirty = true;
+                    }
+                }
+                breath_btn.context_menu(|ui| self.breath_settings(ui));
                 ui.separator();
                 if let Some(s) = &self.session {
                     ui.weak(&s.name);
@@ -4516,9 +4616,17 @@ impl EditorUi {
                     }
                 }
             }
+            // breath goes ahead of physics, which reacts to it
+            let breathing = self.breath_on && {
+                let rows = self.prefs.breath.clone().unwrap_or_else(crate::breath::sdk_rows);
+                self.breath.step(&mut s.puppet, &rows, dt)
+            };
+            if breathing {
+                s.dirty = true;
+            }
             let physics_moved =
                 self.physics_on && s.puppet.has_physics() && s.puppet.step_physics(dt);
-            let animating = following || physics_moved;
+            let animating = following || physics_moved || breathing;
             if physics_moved {
                 s.dirty = true;
             }
@@ -4706,7 +4814,16 @@ impl EditorUi {
     }
 
     fn mesh_edit_window(&mut self, ui: &mut Ui) {
-        let Some(mi) = self.mesh_edit else { return };
+        let Some(mi) = self.mesh_edit else {
+            // however the session ended, its extras end with it
+            self.mesh_edit_also.clear();
+            if let Some(before) = self.mesh_edit_solo.take()
+                && let Some(s) = &mut self.session
+            {
+                s.solo = before;
+            }
+            return;
+        };
         let (verts, tris, id) =
             match self.session.as_ref().and_then(|s| s.puppet.model().art_meshes.get(mi)) {
                 Some(am) => (am.vertex_count as usize, am.indices.len() / 3, am.id.clone()),
@@ -4716,11 +4833,18 @@ impl EditorUi {
         let mut cancel = false;
         let mut dialog_action: Option<MeshAction> = None;
         crate::windows::Dialog::new(crate::i18n::tr("Edit Mesh"))
+            .panel()
             .width(290.0)
             // beside the canvas, not over the mesh being edited
             .at(ui.ctx().content_rect().right_top() + vec2(-200.0, 220.0))
             .show(ui.ctx(), |ui| {
                 ui.label(truncate(&id, 28));
+                if !self.mesh_edit_also.is_empty() {
+                    ui.weak(crate::i18n::trf(
+                        "{count} meshes: click one to edit it",
+                        &[("count", &(self.mesh_edit_also.len() + 1))],
+                    ));
+                }
                 ui.weak(crate::i18n::trf(
                     "{verts} vertices · {tris} triangles",
                     &[("verts", &verts), ("tris", &tris)],
@@ -4768,6 +4892,12 @@ impl EditorUi {
         }
         if done {
             self.mesh_edit = None;
+            self.mesh_edit_also.clear();
+            if let Some(before) = self.mesh_edit_solo.take()
+                && let Some(s) = &mut self.session
+            {
+                s.solo = before;
+            }
             self.mesh_drag = None;
             self.mesh_snapshot = None;
             self.mesh_mode = 0;
@@ -6103,6 +6233,31 @@ impl EditorUi {
     /// Cubism's auto mesh presets do. Spacing and margin are texture pixels.
     /// The meshes a mesh action works on: the one being edited, else the
     /// selection.
+    /// Start Mesh Edit on `mi`, with the rest of the mesh pick along when
+    /// `mi` is in it; `solo` hides everything else until it ends.
+    fn enter_mesh_edit(&mut self, mi: usize, solo: bool) {
+        self.mesh_edit = Some(mi);
+        self.mesh_edit_also = mesh_pick_others(&self.multi_sel, mi);
+        self.mesh_drag = None;
+        let Some(s) = &mut self.session else { return };
+        self.mesh_snapshot = Some(s.puppet.model().clone());
+        if solo {
+            let ids: std::collections::HashSet<String> = std::iter::once(mi)
+                .chain(self.mesh_edit_also.iter().copied())
+                .filter_map(|m| s.puppet.model().art_meshes.get(m).map(|a| a.id.clone()))
+                .collect();
+            self.mesh_edit_solo = Some(s.solo.replace(ids));
+        }
+        if !self.mesh_edit_also.is_empty() {
+            log::info!("Mesh Edit on {} meshes", self.mesh_edit_also.len() + 1);
+        }
+    }
+
+    /// Every mesh in the Mesh Edit session, the one edited first.
+    fn mesh_edit_set(&self) -> Vec<usize> {
+        self.mesh_edit.into_iter().chain(self.mesh_edit_also.iter().copied()).collect()
+    }
+
     fn action_targets(&self) -> Vec<usize> {
         match self.mesh_edit {
             Some(mi) => vec![mi],
@@ -6113,6 +6268,10 @@ impl EditorUi {
     fn run_mesh_action(&mut self, action: MeshAction) {
         let targets = self.action_targets();
         match action {
+            // Auto Mesh covers every mesh in a Mesh Edit session
+            MeshAction::AutoMesh if self.mesh_edit.is_some() => {
+                self.auto_mesh_many(&self.mesh_edit_set())
+            }
             MeshAction::AutoMesh => self.auto_mesh_many(&targets),
             MeshAction::Reset => {
                 let Some(s) = &mut self.session else { return };
@@ -6614,7 +6773,9 @@ impl EditorUi {
                     ui.text_edit_singleline(&mut new.name);
                     ui.end_row();
                     ui.label(crate::i18n::tr("ID"));
-                    ui.text_edit_singleline(&mut new.id);
+                    if ui.text_edit_singleline(&mut new.id).changed() {
+                        deformer_dialog::id_text(&mut new.id);
+                    }
                     ui.end_row();
                     ui.label(crate::i18n::tr("Minimum"));
                     ui.add(egui::DragValue::new(&mut new.min).speed(0.1));
@@ -6658,7 +6819,8 @@ impl EditorUi {
                 let Some(n) = n else { return };
                 (n.name, n.id, n.min, n.default, n.max, n.group, n.blend_shape)
             };
-            let id = if id.is_empty() { name.replace(' ', "") } else { id };
+            let mut id = if id.trim().is_empty() { name.trim().to_string() } else { id };
+            deformer_dialog::id_text(&mut id);
             if let Some(s) = &mut self.session {
                 if s.edit(|m| {
                     let made =
@@ -6687,12 +6849,82 @@ impl EditorUi {
                     }
                     self.sel_param = Some(pi);
                     log::info!("parameter {id} created");
+                    self.last_param_id = Some(id);
                 } else {
                     log::warn!("a parameter with id {id} already exists");
                 }
             }
         } else if !open {
             self.new_param = None;
+        }
+    }
+
+    /// Breath's parameters, from the Breath button's right-click menu: each
+    /// row adds (offset + peak * sin(2 pi t / cycle)) * weight.
+    fn breath_settings(&mut self, ui: &mut Ui) {
+        let mut rows = self.prefs.breath.clone().unwrap_or_else(crate::breath::sdk_rows);
+        let ids: Vec<String> = self
+            .session
+            .as_ref()
+            .map(|s| s.puppet.model().parameters.iter().map(|p| p.id.clone()).collect())
+            .unwrap_or_default();
+        let before = rows.clone();
+        let mut remove = None;
+        egui::Grid::new("breath-rows").num_columns(6).spacing([6.0, 4.0]).show(ui, |ui| {
+            for h in ["Parameter", "Offset", "Peak", "Cycle (s)", "Weight"] {
+                ui.weak(crate::i18n::tr(h));
+            }
+            ui.end_row();
+            for (i, r) in rows.iter_mut().enumerate() {
+                let missing = !ids.contains(&r.param);
+                egui::ComboBox::from_id_salt(("breath-param", i))
+                    .width(130.0)
+                    .selected_text(if missing {
+                        egui::RichText::new(&r.param).color(theme::pal().text_faint)
+                    } else {
+                        egui::RichText::new(&r.param)
+                    })
+                    .show_ui(ui, |ui| {
+                        for id in &ids {
+                            ui.selectable_value(&mut r.param, id.clone(), id);
+                        }
+                    });
+                ui.add(egui::DragValue::new(&mut r.offset).speed(0.05));
+                ui.add(egui::DragValue::new(&mut r.peak).speed(0.05));
+                ui.add(egui::DragValue::new(&mut r.cycle).speed(0.05).range(0.1..=120.0));
+                ui.add(egui::DragValue::new(&mut r.weight).speed(0.01).range(0.0..=1.0));
+                if ui.small_button(egui_phosphor::regular::X).clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(i) = remove {
+            rows.remove(i);
+        }
+        ui.horizontal(|ui| {
+            if ui.button(crate::i18n::tr("Add")).clicked() {
+                let param = ids.first().cloned().unwrap_or_default();
+                rows.push(crate::breath::BreathRow { param, ..Default::default() });
+            }
+            if ui.button(crate::i18n::tr("Reset")).clicked() {
+                rows = crate::breath::sdk_rows();
+            }
+        });
+        ui.weak(crate::i18n::tr("Greyed parameters are not in this model and are skipped."));
+        if rows != before {
+            self.prefs.breath = (rows != crate::breath::sdk_rows()).then_some(rows);
+            self.prefs.save();
+        }
+    }
+
+    /// The ID a new parameter starts with: the last one made, counted on.
+    pub(super) fn next_param_id(&self) -> String {
+        match (&self.last_param_id, &self.session) {
+            (Some(last), Some(s)) => deformer_dialog::next_id(last, |id| {
+                s.puppet.model().parameters.iter().any(|p| p.id == id)
+            }),
+            _ => String::new(),
         }
     }
 
@@ -7137,8 +7369,7 @@ impl EditorUi {
                     self.mesh_edit = None;
                     self.mesh_drag = None;
                 } else if let Some(Sel::Mesh(mi)) = self.selected {
-                    self.mesh_edit = Some(mi);
-                    self.mesh_snapshot = self.session.as_ref().map(|s| s.puppet.model().clone());
+                    self.enter_mesh_edit(mi, false);
                 }
             }
             "auto-mesh" if have => self.run_mesh_action(MeshAction::AutoMesh),
@@ -8330,7 +8561,7 @@ impl EditorUi {
             {
                 self.new_param = Some(ParamNew {
                     name: String::new(),
-                    id: String::new(),
+                    id: self.next_param_id(),
                     min: 0.0,
                     default: 0.0,
                     max: 1.0,
@@ -11973,6 +12204,7 @@ impl EditorUi {
                 {
                     self.selected = Some(Sel::Mesh(mi));
                     self.mesh_edit = Some(mi);
+                    self.mesh_edit_also = mesh_pick_others(&self.multi_sel, mi);
                     self.mesh_drag = None;
                     self.mesh_snapshot = Some(s.puppet.model().clone());
                 }
@@ -12067,6 +12299,7 @@ impl EditorUi {
             if let Some(mi) = cur.or(hits.first().copied()) {
                 self.selected = Some(Sel::Mesh(mi));
                 self.mesh_edit = Some(mi);
+                self.mesh_edit_also = mesh_pick_others(&self.multi_sel, mi);
                 self.mesh_drag = None;
                 self.mesh_snapshot = Some(s.puppet.model().clone());
             } else {
@@ -14508,7 +14741,7 @@ impl EditorUi {
             /// Several points moved in one undo step (a point and its
             /// mirror): each slides over the art when its uv is known.
             SlideMany(usize, Vec<PointMove>),
-            Add(usize, usize, [f32; 3]),
+            Add(usize, usize, [f32; 3], Option<(f32, f32)>),
             /// A point placed by weights on three others, optionally
             /// closing a face onto an edge, with lines to `links`; `follow`
             /// makes it the start of the next line.
@@ -14517,11 +14750,15 @@ impl EditorUi {
             AddRef(usize, [usize; 3], [f32; 3], Option<(u16, u16)>, Vec<u16>, bool),
             Connect(usize, u16, u16),
             Cut(usize, u16, u16),
+            /// The cut tool's sweep: every edge and line it crossed.
+            CutMany(usize, Vec<(u16, u16)>),
             EraseMany(usize, Vec<usize>),
             Del(usize, usize),
             Paste(usize, Vec<ayatsuri_core::edit::PastedPoint>, Vec<[usize; 3]>),
         }
         let mut mesh_op: Option<MeshOp> = None;
+        // a click that moved the editing to another mesh does nothing else
+        let mut mesh_switched = false;
         if self.mesh_edit.is_none() {
             self.mesh_art = None;
             self.stroke_edit = None;
@@ -14529,6 +14766,67 @@ impl EditorUi {
         if let Some(mi) = self.mesh_edit {
             vp.rect_filled(view, 0.0, Color32::from_black_alpha(150));
             let ptr = ui.ctx().input(|i| i.pointer.latest_pos());
+            // the session's other meshes: their lines faint, and a click on
+            // one (off the mesh being edited) moves the editing to it
+            let mut switch_to = None;
+            let screen_tris = |m: usize| -> Vec<[Pos2; 3]> {
+                let Some(g) = s.puppet.mesh_geometry(m) else { return Vec::new() };
+                let (pairs, _) = g.positions.as_chunks::<2>();
+                let pts: Vec<Pos2> = pairs.iter().map(|q| to_screen(q[0], q[1])).collect();
+                g.indices
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .filter_map(|t| {
+                        Some([
+                            *pts.get(t[0] as usize)?,
+                            *pts.get(t[1] as usize)?,
+                            *pts.get(t[2] as usize)?,
+                        ])
+                    })
+                    .collect()
+            };
+            let inside = |tris: &[[Pos2; 3]], p: Pos2| {
+                tris.iter().any(|t| point_edit::point_in_polygon(p, t))
+            };
+            let pick = resp.clicked() && self.mesh_mode == 0;
+            let here = pick.then(|| resp.interact_pointer_pos()).flatten();
+            let on_current = here.is_some_and(|p| inside(&screen_tris(mi), p));
+            for &other in &self.mesh_edit_also {
+                let tris = screen_tris(other);
+                let faint = theme::pal().text_faint.gamma_multiply(0.5);
+                for t in &tris {
+                    vp.add(egui::Shape::closed_line(t.to_vec(), Stroke::new(0.6, faint)));
+                }
+                if switch_to.is_none()
+                    && !on_current
+                    && let Some(p) = here
+                    && inside(&tris, p)
+                {
+                    switch_to = Some(other);
+                }
+            }
+            if let Some(other) = switch_to {
+                let unfinished =
+                    s.puppet.model().art_meshes.get(mi).and_then(|m| {
+                        mesh_unfinished(m.vertex_count as usize, m.indices.len() / 3)
+                    });
+                if let Some(why) = unfinished {
+                    set_notice(&mut self.notice, crate::i18n::tr(why));
+                } else {
+                    self.mesh_edit_also.retain(|&m| m != other);
+                    self.mesh_edit_also.push(mi);
+                    self.mesh_edit = Some(other);
+                    self.selected = Some(Sel::Mesh(other));
+                    self.mesh_drag = None;
+                    self.edge_first = None;
+                    self.mesh_picked.clear();
+                    self.cut_sweep = None;
+                    self.cut_marked.clear();
+                    mesh_switched = true;
+                    ui.ctx().request_repaint();
+                }
+            }
             let mesh_id = Some(s.mesh_name(mi));
             let parent = s.puppet.model().art_meshes.get(mi).and_then(|m| m.parent_deformer);
             let tex_slot =
@@ -14650,6 +14948,54 @@ impl EditorUi {
                 {
                     mesh_op = Some(MeshOp::Cut(mi, a, b));
                 }
+                // a drag with the cut tool that starts off a point sweeps:
+                // every edge or line it crosses goes, in one undo step
+                if !space && self.mesh_mode == 4 && !alt {
+                    if resp.drag_started() && near.is_none() {
+                        self.cut_sweep = resp.interact_pointer_pos();
+                        self.cut_marked.clear();
+                    }
+                    if let (Some(from), Some(to)) = (self.cut_sweep, ptr)
+                        && resp.dragged()
+                    {
+                        let (tris, _) = g.indices.as_chunks::<3>();
+                        let lines = self.pending_edges.get(&mi).map(Vec::as_slice).unwrap_or(&[]);
+                        for (a, b) in tris
+                            .iter()
+                            .flat_map(|t| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])])
+                            .chain(lines.iter().copied())
+                        {
+                            let (Some(&pa), Some(&pb)) =
+                                (screen_pts.get(a as usize), screen_pts.get(b as usize))
+                            else {
+                                continue;
+                            };
+                            if point_edit::segments_cross(from, to, pa, pb)
+                                || point_edit::segment_distance(to, pa, pb) < 6.0
+                            {
+                                self.cut_marked.insert((a.min(b), a.max(b)));
+                            }
+                        }
+                        self.cut_sweep = Some(to);
+                    }
+                    for &(a, b) in &self.cut_marked {
+                        if let (Some(&pa), Some(&pb)) =
+                            (screen_pts.get(a as usize), screen_pts.get(b as usize))
+                        {
+                            vp.line_segment([pa, pb], Stroke::new(3.0, theme::pal().rotation_red));
+                        }
+                    }
+                    if resp.drag_stopped() && self.cut_sweep.take().is_some() {
+                        let edges: Vec<(u16, u16)> =
+                            std::mem::take(&mut self.cut_marked).into_iter().collect();
+                        if !edges.is_empty() {
+                            mesh_op = Some(MeshOp::CutMany(mi, edges));
+                        }
+                    }
+                } else {
+                    self.cut_sweep = None;
+                    self.cut_marked.clear();
+                }
                 // Add vertex on an existing point: the chain moves to it,
                 // drawing a line from the chain's end first
                 if !space
@@ -14769,7 +15115,12 @@ impl EditorUi {
                         && self.mesh_autoconnect
                         && chain.is_none()
                     {
-                        mesh_op = Some(MeshOp::Add(mi, ti, w));
+                        // the texture spot from the art as shown, as a drag's
+                        let art_spot =
+                            self.mesh_art.as_ref().filter(|a| a.mesh == mi).and_then(|a| {
+                                art_uv(&art_screen(a, &to_screen), &a.indices, &a.uvs, ptr)
+                            });
+                        mesh_op = Some(MeshOp::Add(mi, ti, w, art_spot));
                     } else if let Some((c, w)) = on_art {
                         // outside the faces, auto connect closes a face onto
                         // the nearest open edge (unless drawing a line)
@@ -15154,10 +15505,21 @@ impl EditorUi {
                         && let Some(d) = self.mesh_drag.take()
                         && (d.dx != 0.0 || d.dy != 0.0)
                     {
-                        // the texture coordinate that was under the drop
-                        let uv = ptr
-                            .and_then(|p| mesh_weights(&d.start, &d.indices, p))
-                            .and_then(|(t, w)| mix_uv(&d.model_uvs, t, w));
+                        // the texture coordinate under the drop, read from
+                        // the art as shown (the mesh as Mesh Edit began):
+                        // read from the mesh as edited so far, each edit's
+                        // rounding fed the next and the art drifted
+                        let art = self
+                            .mesh_art
+                            .as_ref()
+                            .filter(|a| a.mesh == mi)
+                            .map(|a| (art_screen(a, &to_screen), a));
+                        let uv_at = |p: Pos2| match &art {
+                            Some((pts, a)) => art_uv(pts, &a.indices, &a.uvs, p),
+                            None => mesh_weights(&d.start, &d.indices, p)
+                                .and_then(|(t, w)| mix_uv(&d.model_uvs, t, w)),
+                        };
+                        let uv = ptr.and_then(uv_at);
                         mesh_op = Some(match (uv, d.partner) {
                             (uv, Some((j, pdx, pdy))) => {
                                 // the mirror's drop: its start, moved the
@@ -15165,9 +15527,7 @@ impl EditorUi {
                                 let drop = ptr.zip(d.start.get(d.vertex)).zip(d.start.get(j)).map(
                                     |((p, &a), &b)| pos2(b.x - (p.x - a.x), b.y + (p.y - a.y)),
                                 );
-                                let puv = drop
-                                    .and_then(|p| mesh_weights(&d.start, &d.indices, p))
-                                    .and_then(|(t, w)| mix_uv(&d.model_uvs, t, w));
+                                let puv = drop.and_then(uv_at);
                                 MeshOp::SlideMany(
                                     mi,
                                     vec![(d.vertex, d.dx, d.dy, uv), (j, pdx, pdy, puv)],
@@ -15387,7 +15747,24 @@ impl EditorUi {
                 }
             }
         }
-        if let Some(op) = mesh_op {
+        if let Some(op) = mesh_op.filter(|_| !mesh_switched) {
+            // the points this op moves or adds, whose texture spot is read
+            // again where they end up drawn
+            let settle: Option<(usize, Vec<usize>)> = {
+                let count = |mi: usize| {
+                    s.puppet.model().art_meshes.get(mi).map_or(0, |m| m.vertex_count as usize)
+                };
+                match &op {
+                    MeshOp::Slide(mi, vi, ..) => Some((*mi, vec![*vi])),
+                    MeshOp::SlideMany(mi, moves) => {
+                        Some((*mi, moves.iter().filter(|m| m.3.is_some()).map(|m| m.0).collect()))
+                    }
+                    MeshOp::Add(mi, ..) | MeshOp::AddRef(mi, ..) | MeshOp::AddFree(mi, ..) => {
+                        Some((*mi, vec![count(*mi)]))
+                    }
+                    _ => None,
+                }
+            };
             let applied = match op {
                 MeshOp::Move(mi, vi, dx, dy) => {
                     s.edit(|m| ayatsuri_core::edit::move_vertex(m, mi, vi, dx, dy))
@@ -15410,9 +15787,20 @@ impl EditorUi {
                         any
                     })
                 }
-                MeshOp::Add(mi, ti, w) => {
+                MeshOp::Add(mi, ti, w, spot) => {
                     let n = s.puppet.model().art_meshes.get(mi).map_or(0, |m| m.vertex_count);
-                    let ok = s.edit(|m| ayatsuri_core::edit::add_vertex(m, mi, ti, w).is_some());
+                    let ok = s.edit(|m| {
+                        let Some(v) = ayatsuri_core::edit::add_vertex(m, mi, ti, w) else {
+                            return false;
+                        };
+                        if let Some((u, t)) = spot
+                            && let Some(am) = m.art_meshes.get_mut(mi)
+                            && let Some(pair) = am.uvs.get_mut(v * 2..v * 2 + 2)
+                        {
+                            pair.copy_from_slice(&[u, t]);
+                        }
+                        true
+                    });
                     if ok && self.mesh_mode == 1 {
                         self.edge_first = Some(n as usize);
                     }
@@ -15503,6 +15891,50 @@ impl EditorUi {
                         true
                     }
                 }
+                MeshOp::CutMany(mi, edges) => {
+                    let pending = self.pending_edges.entry(mi).or_default();
+                    let before = pending.len();
+                    pending.retain(|e| !edges.contains(e));
+                    let lines = before - pending.len();
+                    // the faces on the cut edges go; their other sides that
+                    // are not cut themselves stay as lines, as one cut does
+                    let tris: Vec<[u16; 3]> = s
+                        .puppet
+                        .model()
+                        .art_meshes
+                        .get(mi)
+                        .map(|m| m.indices.as_chunks::<3>().0.to_vec())
+                        .unwrap_or_default();
+                    let mut sides: Vec<(u16, u16)> = Vec::new();
+                    let mut faces = false;
+                    for &[x, y, z] in &tris {
+                        let tri_edges = [(x, y), (y, z), (z, x)].map(|(p, q)| (p.min(q), p.max(q)));
+                        if tri_edges.iter().any(|e| edges.contains(e)) {
+                            faces = true;
+                            sides.extend(tri_edges.iter().filter(|e| !edges.contains(e)));
+                        }
+                    }
+                    let ok = !faces
+                        || s.edit(|m| {
+                            let mut any = false;
+                            for &(a, b) in &edges {
+                                any |= ayatsuri_core::edit::remove_edge(m, mi, a, b);
+                            }
+                            any
+                        });
+                    if faces && ok {
+                        let model = s.puppet.model();
+                        for (x, y) in sides {
+                            if !ayatsuri_core::edit::has_edge(model, mi, x, y)
+                                && !pending.contains(&(x, y))
+                            {
+                                pending.push((x, y));
+                            }
+                        }
+                    }
+                    log::debug!("mesh {mi}: cut sweep removed {} edge(s) and line(s)", edges.len());
+                    ok && (faces || lines > 0)
+                }
                 MeshOp::EraseMany(mi, marked) => {
                     self.pending_edges.remove(&mi);
                     self.edge_first = None;
@@ -15569,6 +16001,22 @@ impl EditorUi {
             };
             if !applied {
                 log::warn!("mesh edit had nothing to do");
+            } else if let Some((mi, verts)) = settle
+                && let Some(art) = self.mesh_art.as_ref().filter(|a| a.mesh == mi)
+                && let Some(g) = s.puppet.mesh_geometry(mi)
+            {
+                let spots = art_spots_where_drawn(art, g.positions, &verts);
+                if !spots.is_empty() {
+                    s.amend(|m| {
+                        let Some(am) = m.art_meshes.get_mut(mi) else { return false };
+                        for &(v, (u, t)) in &spots {
+                            if let Some(pair) = am.uvs.get_mut(v * 2..v * 2 + 2) {
+                                pair.copy_from_slice(&[u, t]);
+                            }
+                        }
+                        true
+                    });
+                }
             }
         }
 
@@ -16474,6 +16922,14 @@ pub(crate) const KEY_ACTIONS: &[(&str, &str, &str, egui::Modifiers, egui::Key)] 
     ]
 };
 
+/// What Settings stores for an action whose default key was removed.
+pub(crate) const UNSET_KEY: &str = "none";
+
+/// The actions whose keys still work while a text field is being typed in.
+fn shortcut_while_typing(id: &str) -> bool {
+    matches!(id, "save" | "save-as")
+}
+
 pub(crate) fn format_shortcut(sc: &egui::KeyboardShortcut) -> String {
     // F35 stands for an action with no key yet
     if sc.logical_key == egui::Key::F35 && sc.modifiers.is_none() {
@@ -16539,6 +16995,10 @@ pub(crate) fn captured_key(
 }
 
 fn parse_shortcut(text: &str) -> Option<egui::KeyboardShortcut> {
+    // an action the user unassigned: no key, as F35 stands for
+    if text == UNSET_KEY {
+        return Some(egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::F35));
+    }
     let mut mods = egui::Modifiers::NONE;
     let mut key = None;
     for part in text.split('+') {
@@ -18036,6 +18496,20 @@ fn set_notice(slot: &mut Option<(String, Option<f64>)>, text: &str) {
 
 /// Why a mesh being edited cannot be finished yet: it needs three points and
 /// a triangle to be drawn at all. Cancel still puts it back.
+/// The rest of the mesh pick, when `mi` is in it: the other meshes a Mesh
+/// Edit session on `mi` takes along.
+fn mesh_pick_others(pick: &[usize], mi: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    if pick.contains(&mi) {
+        for &m in pick {
+            if m != mi && !out.contains(&m) {
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
 fn mesh_unfinished(verts: usize, tris: usize) -> Option<&'static str> {
     if verts < 3 {
         Some("A mesh needs at least three points. Add points, or Cancel to undo the edit.")
@@ -19118,6 +19592,41 @@ mod key_cmd_tests {
         ed
     }
 
+    #[test]
+    fn mesh_edit_takes_the_rest_of_the_pick_and_solo_ends_with_it() {
+        assert_eq!(mesh_pick_others(&[3, 1, 3, 2], 1), [3, 2]);
+        assert!(mesh_pick_others(&[3, 2], 1).is_empty());
+        let mut ed = editor();
+        ed.multi_sel = vec![0];
+        ed.enter_mesh_edit(0, true);
+        assert_eq!(ed.mesh_edit_set(), [0]);
+        let solo = ed.session.as_ref().unwrap().solo.clone().unwrap();
+        assert!(solo.contains("ArtMesh0"));
+        assert_eq!(ed.mesh_edit_solo, Some(None));
+    }
+
+    #[test]
+    fn replicate_makes_one_copy_of_each_picked_parameter() {
+        let mut ed = editor();
+        let s = ed.session.as_mut().unwrap();
+        let made = s.edit(|m| {
+            ayatsuri_core::edit::create_parameter(m, "Q".into(), 0.0, 0.0, 1.0).is_some()
+        });
+        assert!(made);
+        s.param_names.resize(2, String::new());
+        s.param_names[0] = "Hair".into();
+        s.param_names[1] = "Hair".into();
+        s.param_picked = vec![0, 1];
+        ed.run_param_cmd(param_menu::ParamCmd::Replicate(0));
+        let s = ed.session.as_ref().unwrap();
+        let ids: Vec<&str> = s.puppet.model().parameters.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["P", "Q", "P2", "Q3"]);
+        // two parameters both called Hair still get copies with their own names
+        assert_eq!(s.param_names, ["Hair", "Hair", "Hair 2", "Hair 3"]);
+        assert_eq!(s.param_colors.len(), 4);
+        assert_eq!(s.param_picked, [2, 3]);
+    }
+
     fn mesh(ed: &EditorUi) -> ArtMesh {
         ed.session.as_ref().unwrap().puppet.model().art_meshes[0].clone()
     }
@@ -19305,6 +19814,89 @@ mod point_paste_tests {
     use super::*;
 
     #[test]
+    fn a_point_shows_the_art_where_it_draws_not_where_it_was_dropped() {
+        // one triangle of art, uv = position / 10
+        let art = MeshArt {
+            mesh: 0,
+            positions: vec![0.0, 0.0, 10.0, 0.0, 0.0, 10.0],
+            uvs: vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+            indices: vec![0, 1, 2],
+            reference: ayatsuri_format::model::ArtMesh {
+                id: "A".into(),
+                parent_part: None,
+                parent_deformer: None,
+                visible: true,
+                enabled: true,
+                texture: 0,
+                flags: 0,
+                blend: Default::default(),
+                vertex_count: 3,
+                uvs: vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+                indices: vec![0, 1, 2],
+                masks: vec![],
+                binding: Default::default(),
+                opacities: vec![1.0],
+                draw_orders: vec![500.0],
+                positions: vec![0.0, 0.0, 10.0, 0.0, 0.0, 10.0],
+                blend_shapes: Vec::new(),
+                clip_group: None,
+                clip_inherit: false,
+                multiply: Vec::new(),
+                screen: Vec::new(),
+            },
+        };
+        // dropped at (4, 4) but the warp drew it at (5, 3)
+        let drawn = [0.0, 0.0, 10.0, 0.0, 0.0, 10.0, 5.0, 3.0];
+        let spots = art_spots_where_drawn(&art, &drawn, &[3]);
+        assert_eq!(spots.len(), 1);
+        let (v, (u, t)) = spots[0];
+        assert_eq!(v, 3);
+        assert!((u - 0.5).abs() < 1e-6 && (t - 0.3).abs() < 1e-6, "{u} {t}");
+    }
+
+    #[test]
+    fn mesh_edit_reads_the_texture_spot_from_the_art_as_shown() {
+        // a 3x3 grid under a bending warp: on screen the art is bent, while
+        // its uv is the straight grid
+        let bend = |u: f32, v: f32| pos2(u + 0.3 * u * v, v + 0.25 * u * (1.0 - v));
+        let mut uvs = Vec::new();
+        let mut art = Vec::new();
+        for j in 0..3 {
+            for i in 0..3 {
+                let (u, v) = (i as f32 / 2.0, j as f32 / 2.0);
+                uvs.extend([u, v]);
+                art.push(bend(u, v));
+            }
+        }
+        let mut idx = Vec::new();
+        for j in 0..2u16 {
+            for i in 0..2u16 {
+                let a = j * 3 + i;
+                idx.extend([a, a + 1, a + 4, a, a + 4, a + 3]);
+            }
+        }
+        // sixty small drags of the middle point, each spot read two ways
+        let (mut pts, mut old_uvs) = (art.clone(), uvs.clone());
+        let mut new_uvs = uvs.clone();
+        for k in 0..60 {
+            let drop = art[4] + vec2(0.03 * (k as f32).cos(), 0.03 * (k as f32).sin());
+            let (t, w) = mesh_weights(&pts, &idx, drop).unwrap();
+            let old = mix_uv(&old_uvs, t, w).unwrap();
+            let new = art_uv(&art, &idx, &uvs, drop).unwrap();
+            (old_uvs[8], old_uvs[9]) = old;
+            (new_uvs[8], new_uvs[9]) = new;
+            pts[4] = drop;
+        }
+        // the last drop: read from the art as shown, the point takes the
+        // spot the user saw there; read from the mesh as edited, the edits'
+        // error has piled up into it
+        let shown = art_uv(&art, &idx, &uvs, pts[4]).unwrap();
+        assert!((new_uvs[8] - shown.0).abs() < 1e-6 && (new_uvs[9] - shown.1).abs() < 1e-6);
+        let drift = (old_uvs[8] - shown.0).abs() + (old_uvs[9] - shown.1).abs();
+        assert!(drift > 1e-3, "the old reading drifted only {drift}");
+    }
+
+    #[test]
     fn basis_weights_skip_points_in_a_line() {
         // the two nearest and the third are in a line; the fourth is not
         let pts = [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(2.0, 0.0), pos2(0.0, 3.0)];
@@ -19452,6 +20044,15 @@ mod palette_pick_tests {
         assert!(near(l2, (mid2 - l.1, mid2 - l.0)), "{l:?} -> {l2:?}");
         assert!(near(r2, (mid2 - r.1, mid2 - r.0)), "{r:?} -> {r2:?}");
         assert!(l2.0 > r2.1, "they swapped sides");
+    }
+
+    #[test]
+    fn an_unassigned_shortcut_has_no_key() {
+        let sc = parse_shortcut(UNSET_KEY).unwrap();
+        assert_eq!(format_shortcut(&sc), "");
+        let mut ed = EditorUi::new();
+        ed.prefs.keybinds.push(("auto-connect".into(), UNSET_KEY.into()));
+        assert_eq!(format_shortcut(&ed.bound("auto-connect")), "");
     }
 
     #[test]

@@ -1348,7 +1348,7 @@
   "Clip groups": "クリップグループ",
   "Name a set of masks in the Inspector so several meshes clip by it together, and change together": "インスペクターでマスクのセットに名前を付けると、複数のメッシュがそれでまとめてクリッピングされ、一緒に変更されます",
   "Add vertex: each click draws a line from the last point. Ctrl+click adds a single point, Shift+click keeps the line's start, Esc ends the line, Alt+click deletes a point or line": "頂点の追加：クリックごとに直前の点から線を引きます。Ctrl+クリックで単独の点、Shift+クリックで線の始点を保持、Escで線を終了、Alt+クリックで点や線を削除",
-  "Delete edge (line): click a line, or its two points": "辺（線）を削除：線をクリック、またはその両端の点をクリック",
+  "Delete edge (line): click a line or its two points, or drag across lines": "辺（線）を削除：線をクリック、またはその両端の点をクリック、または線をなぞってドラッグ",
   "Keep faces inside the outline you drew with lines; with none drawn, no faces over empty texture, so hair and lashes don't get bridged": "線で描いた外周の内側だけに面を作ります。線がない場合は空のテクスチャ上に面を作らず、髪やまつ毛がつながらないようにします",
   "Cubism's Automatic Mesh generator, applied to every selected mesh. Intervals are the gaps between points on the outline and inside. Margins are pixels on a 1024px texture and grow with larger textures: outside is how far the outline stands off the art, inside how far in the inner ring runs.": "Cubism の自動メッシュ生成と同じで、選択中のすべてのメッシュに適用されます。点の間隔は外周と内側の点どうしの間隔です。余白は 1024px テクスチャでのピクセル数で、テクスチャが大きいほど広がります。外側は外周が絵からどれだけ離れるか、内側は内側のリングが縁からどれだけ内に入るかです。",
   "Vertices interval (outside)": "頂点の間隔（外側）",
@@ -1548,5 +1548,18 @@
   "Manual setup": "手動設定",
   "Interval": "間隔",
   "In Parts palette order, the top row highest. Meshes in a draw order group keep theirs.": "パーツパレットの順で、一番上の行が最も大きくなります。描画順グループ内のメッシュはそのままです。",
-  "Deform Path works at edit level 2 or 3": "変形パスは編集レベル2か3で使えます"
+  "Deform Path works at edit level 2 or 3": "変形パスは編集レベル2か3で使えます",
+  "Remove this shortcut": "このショートカットを外す",
+  "Output parameters": "出力パラメータ",
+  "used by {group}": "{group} で使用中",
+  "Another group already drives a picked parameter; the two will fight over it.": "選んだパラメータの中に、他のグループがすでに動かしているものがあります。2つのグループが競合します。",
+  "Breath": "呼吸",
+  "Idle breathing in the preview; right-click to choose the parameters": "プレビューで待機中の呼吸を再生します。右クリックでパラメータを選択",
+  "Offset": "オフセット",
+  "Peak": "ピーク",
+  "Cycle (s)": "周期（秒）",
+  "Greyed parameters are not in this model and are skipped.": "グレーのパラメータはこのモデルにないため、スキップされます。",
+  "Edit Mesh (Solo)": "メッシュを編集（ソロ）",
+  "Edit the selected meshes with everything else hidden": "選択したメッシュを、他をすべて非表示にして編集します",
+  "{count} meshes: click one to edit it": "{count} 個のメッシュ：クリックで編集対象を切り替え"
 }
