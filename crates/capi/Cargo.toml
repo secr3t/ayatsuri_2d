@@ -29,7 +29,9 @@ fixture = []
 ayatsuri-core = { workspace = true }
 ayatsuri-format = { workspace = true }
 # moc3 and the Cubism JSON files only: no paint or project parsers here
-ayatsuri-import = { workspace = true, default-features = false }
+# by path: newer cargo refuses default-features = false on a workspace
+# dependency that leaves its defaults on
+ayatsuri-import = { path = "../import", default-features = false }
 serde_bytes = { workspace = true }
 
 [[example]]
